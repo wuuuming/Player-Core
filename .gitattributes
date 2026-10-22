@@ -1,0 +1,5 @@
+# Text files are stored and checked out with LF on every platform.
+* text=auto eol=lf
+
+# Third-party files are kept byte for byte as shipped.
+crates/player-core/third_party/** -text

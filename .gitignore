@@ -1,0 +1,7 @@
+/target
+**/target
+*.pdb
+*.dll
+
+# The vendored audio-only FFmpeg (third_party/ffmpeg/bin) is part of the source tree.
+!crates/player-core/third_party/ffmpeg/bin/*.dll

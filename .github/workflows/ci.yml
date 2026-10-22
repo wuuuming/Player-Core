@@ -1,0 +1,31 @@
+# CI: fmt, build, clippy and the unit tests (`python tools/ci.py`) on GitHub's Windows and Linux
+# runners, on a push to `main`, a pull request or by hand. Nothing is set up first: the build
+# fetches what it needs (on Windows the FFmpeg SDK). Integration tests and their fixtures are
+# maintained separately.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: toolchain
+        run: rustup toolchain install   # rust-toolchain.toml
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt, build, clippy, tests
+        run: python tools/ci.py

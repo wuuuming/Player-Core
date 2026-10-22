@@ -1,0 +1,12 @@
+# media-io — the bytes a media session reads: the seekable byte source, where it comes from, and
+# the factory an audio session reopens one through. No decoder, no FFmpeg:
+# a transport (file, HTTP, SFTP) builds on this alone.
+[package]
+name = "media-io"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true

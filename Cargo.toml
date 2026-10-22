@@ -1,0 +1,32 @@
+# Player-Core: NovaPlayer's audio core (FFmpeg decode, WASAPI/ASIO output on Windows, ffmpeg and
+# PulseAudio on Linux, tags), split from BiliNova.
+[workspace]
+resolver = "2"
+members = ["crates/player-core", "crates/media-io"]
+exclude = ["vendor"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Every crate inherits these (`[lints] workspace = true`). principles.md B4: an `unsafe` block
+# states its contract; a failure is a value, not a panic (unwrap/expect stay in tests, clippy.toml);
+# leftovers of debugging do not reach a commit.
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "warn"
+expect_used = "warn"
+
+[workspace.dependencies]
+windows = "=0.58.0"
+windows-core = "=0.58.0"
+cpal = "=0.15.3"
+
+# cpal 0.15.3 with one change (vendor/cpal/PATCHED.md): a paused WASAPI stream stops waking a
+# hundred times a second. A dependent workspace (NovaPlayer) carries the same patch, from this
+# repository at the Player-Core rev it uses, since a [patch] applies only at the root.
+[patch.crates-io]
+cpal = { path = "vendor/cpal" }

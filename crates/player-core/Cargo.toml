@@ -1,0 +1,77 @@
+[package]
+name = "player-core"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+build = "build.rs"
+
+[features]
+default = []
+# ASIO output through a vendor driver. OFF by default: `asio-sys` runs bindgen over the Steinberg
+# ASIO SDK at build time, so turning it on needs LLVM's libclang (`LIBCLANG_PATH`); the SDK is
+# downloaded by the build (or `CPAL_ASIO_DIR`). Off, every output goes through WASAPI as before.
+asio = ["cpal/asio", "dep:asio-sys"]
+# Diagnostic console lines (Rust and native), the process-lifetime activity/runtime counts and the
+# work counters tests observe. Off in a plain library build; the app turns it on.
+instrument = []
+# The null output (the clock instead of a device) and its knobs, for the tests of this crate and
+# of its users (a dev-dependency with this feature), and the hidden `internals` the separately
+# maintained tests reach (those that need a fixture or the test CLAP effect); never in a
+# product build.
+test-support = []
+
+[dependencies]
+clap-sys = "=0.5.0"
+media-io = { path = "../media-io" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.189"
+# The CLAP host's own window for plugins that only embed (the same crate and version as novaui).
+x11-dl = "=2.21.0"
+lofty = "=0.25.4"
+encoding_rs = "=0.8.35"
+
+[target.'cfg(windows)'.dependencies]
+cpal = { workspace = true }
+# The driver list and a single driver's load, without loading every installed driver the way
+# cpal's device iterator does. The same crate and major version cpal's own `asio` feature pulls.
+asio-sys = { version = "0.2", optional = true }
+# What `windows`' `#[implement]` expands to name (the endpoint watch).
+windows-core = { workspace = true }
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+  # The endpoint watch's IMMNotificationClient.
+  "implement",
+  # The render endpoints' ids, names and mix formats, which cpal does not expose.
+  "Win32_Devices_FunctionDiscovery",
+  "Win32_Foundation",
+  "Win32_Globalization",
+  "Win32_Media_Audio",
+  "Win32_Security",
+  # COM on the ASIO driver thread.
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Threading",
+  "Win32_UI_Shell_PropertiesSystem",
+  # The CLAP host: plugin libraries and the host thread's message loop.
+  "Win32_System_LibraryLoader",
+  "Win32_UI_WindowsAndMessaging",
+  # ... and its own window for plugins that only embed.
+  "Win32_Graphics_Gdi",
+  "Win32_UI_HiDpi",
+]
+
+[dev-dependencies]
+# The tests run on the null output.
+player-core = { path = ".", features = ["test-support"] }
+
+[build-dependencies]
+cc = "1"
+# Checks what the build script downloads (the FFmpeg SDK, for Windows targets).
+sha2 = "0.10"
+
+[lints]
+workspace = true
