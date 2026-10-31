@@ -35,7 +35,7 @@ rm -rf /out/*
     --enable-avcodec --enable-avformat --enable-avfilter --enable-swresample \
     --enable-decoder="$DECODERS" \
     --enable-demuxers --enable-parsers --enable-bsfs \
-    --enable-network --enable-protocol=file,pipe,data,http,https,tls,tcp,crypto,cache \
+    --enable-network --enable-protocol=file,pipe,data,http,https,httpproxy,tls,tcp,crypto,cache \
     --enable-filter=abuffer,abuffersink,surround,aformat,aresample,anull \
     --extra-ldflags=-static-libgcc \
     >/tmp/configure.log 2>&1 || { tail -40 /tmp/configure.log; exit 1; }
