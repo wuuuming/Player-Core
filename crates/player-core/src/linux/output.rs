@@ -42,6 +42,10 @@ pub struct AudioOutputSystem {
 /// otherwise), the server's default marked. The shim keeps Windows' host names: `Wasapi` is the
 /// sound server, a device id is a sink name.
 pub fn enumerate_output_systems() -> Vec<AudioOutputSystem> {
+    #[cfg(feature = "test-support")]
+    if NULL_OUTPUT.load(Ordering::Relaxed) {
+        return crate::null_output_systems();
+    }
     if !pulse::available() {
         return vec![AudioOutputSystem {
             host: AudioOutputHost::Wasapi,

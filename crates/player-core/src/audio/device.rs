@@ -107,6 +107,10 @@ pub struct AudioOutputSystem {
 /// already loaded is asked what it can do. Blocks for as long as Windows takes to answer; call it
 /// off a window's thread.
 pub fn enumerate_output_systems() -> Vec<AudioOutputSystem> {
+    #[cfg(feature = "test-support")]
+    if NULL_OUTPUT.load(Ordering::Acquire) {
+        return crate::null_output_systems();
+    }
     let default = super::endpoints::default_render_id();
     let wasapi = super::endpoints::render_endpoints().unwrap_or_default();
     #[cfg(feature = "asio")]

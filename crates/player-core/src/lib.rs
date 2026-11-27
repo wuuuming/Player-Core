@@ -102,6 +102,29 @@ pub use audio::{
 #[cfg(windows)]
 #[cfg(feature = "instrument")]
 pub use audio::{audio_runtime_counts, AudioRuntimeCounts};
+/// The null output lists the same endpoints regardless of the machine it runs on.
+#[cfg(all(feature = "test-support", any(windows, target_os = "linux")))]
+fn null_output_systems() -> Vec<AudioOutputSystem> {
+    let device = |id: &str, name: &str, is_default, rate| AudioOutputDeviceInfo {
+        id: id.into(),
+        name: name.into(),
+        is_default,
+        generic: false,
+        caps: Some(AudioDeviceCaps {
+            channels: 2,
+            rates: vec![rate],
+            dsd: None,
+        }),
+    };
+    vec![AudioOutputSystem {
+        host: AudioOutputHost::Wasapi,
+        devices: vec![
+            device("null-speakers", "Reference Speakers", true, 48_000),
+            device("null-headphones", "Studio Headphones", false, 44_100),
+        ],
+    }]
+}
+
 /// The null output (the clock, no device) and its knobs, for tests: never in a product build.
 #[cfg(windows)]
 #[cfg(feature = "test-support")]
