@@ -102,7 +102,10 @@ pub use audio::{
 #[cfg(windows)]
 #[cfg(feature = "instrument")]
 pub use audio::{audio_runtime_counts, AudioRuntimeCounts};
-/// The null output lists the same endpoints regardless of the machine it runs on.
+
+/// What the null output lists, the same on every machine: two endpoints with names as long as
+/// real ones, and on Windows with ASIO built one driver, not loaded, so the choice of system
+/// shows.
 #[cfg(all(feature = "test-support", any(windows, target_os = "linux")))]
 fn null_output_systems() -> Vec<AudioOutputSystem> {
     let device = |id: &str, name: &str, is_default, rate| AudioOutputDeviceInfo {
@@ -116,13 +119,36 @@ fn null_output_systems() -> Vec<AudioOutputSystem> {
             dsd: None,
         }),
     };
-    vec![AudioOutputSystem {
+    let mut systems = vec![AudioOutputSystem {
         host: AudioOutputHost::Wasapi,
         devices: vec![
-            device("null-speakers", "Reference Speakers", true, 48_000),
-            device("null-headphones", "Studio Headphones", false, 44_100),
+            device(
+                "null-speakers",
+                "Speakers (Reference Audio Device)",
+                true,
+                48_000,
+            ),
+            device(
+                "null-headphones",
+                "Headphones (Studio USB Audio Interface)",
+                false,
+                44_100,
+            ),
         ],
-    }]
+    }];
+    if cfg!(all(windows, feature = "asio")) {
+        systems.push(AudioOutputSystem {
+            host: AudioOutputHost::Asio,
+            devices: vec![AudioOutputDeviceInfo {
+                id: "Reference ASIO Driver".into(),
+                name: "Reference ASIO Driver".into(),
+                is_default: false,
+                generic: false,
+                caps: None,
+            }],
+        });
+    }
+    systems
 }
 
 /// The null output (the clock, no device) and its knobs, for tests: never in a product build.
