@@ -687,12 +687,23 @@ impl Writer {
         }
         self.look_ahead()?;
         self.follow_route()?;
-        if self.going.is_some() {
-            if !self.processing.fading() {
-                // The crossfade is over: what the going song has left is not heard.
-                self.going = None;
-            } else if self.processing.going_wanted(self.buf.len() / FRAME_BYTES) > 0 {
-                return self.read_going();
+        if !self.processing.fading() {
+            self.going = None;
+        } else if let Some(going) = &mut self.going {
+            let frames = self.processing.going_wanted(self.buf.len() / FRAME_BYTES);
+            if frames > 0 {
+                going.buf.resize(frames * FRAME_BYTES, 0);
+                let cancelled = || self.r.cancelled();
+                match going.reading.read(&mut going.buf) {
+                    Ok(None) => {}
+                    Ok(Some(0)) | Err(_) => {
+                        // Only the outgoing song ended or failed; the incoming song keeps playing.
+                        self.processing.going_ended(cancelled);
+                        self.going = None;
+                    }
+                    Ok(Some(n)) => self.processing.going(&going.buf[..n], cancelled),
+                }
+                return Ok(());
             }
         }
         let end = self.read_end();
@@ -874,33 +885,6 @@ impl Writer {
         })
     }
 
-    /// Reads the going song's decoder for the crossfade; its end, its failure or its silence past
-    /// the output guard leave the coming one to finish rising alone: they are not the stream's.
-    fn read_going(&mut self) -> Result<(), Done> {
-        let Some(going) = self.going.as_mut() else {
-            return Ok(());
-        };
-        let wanted = self.processing.going_wanted(self.buf.len() / FRAME_BYTES) * FRAME_BYTES;
-        let start = going.buf.len();
-        going.buf.resize(start + wanted, 0);
-        let read = going.reading.read(&mut going.buf[start..]);
-        let n = read.as_ref().ok().copied().flatten().unwrap_or(0);
-        going.buf.truncate(start + n);
-        let r = &self.r;
-        if n > 0 {
-            self.processing.going(&going.buf, || r.cancelled());
-            going.buf.clear();
-        }
-        if matches!(read, Ok(Some(0)) | Err(_)) {
-            self.processing.going_ended(|| r.cancelled());
-            self.going = None;
-        }
-        if self.r.cancelled() {
-            return Err(Done);
-        }
-        Ok(())
-    }
-
     /// The last whole frames, then what the song's chain still holds; then, unless a song
     /// follows (`go_on_into`), what the stream's chain still holds: the sound's end.
     fn write_song_tail(&mut self) -> Result<(), Done> {
@@ -964,8 +948,7 @@ impl Writer {
     }
 }
 
-/// The song going out under a crossfade: its decoder, read alongside the coming one's, and what of
-/// its output is not yet a whole frame.
+/// The outgoing decoder and its reusable read buffer.
 struct Going {
     reading: Reading,
     buf: Vec<u8>,
