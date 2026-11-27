@@ -10,7 +10,7 @@
 <p align="center"><a href="README.md">English</a> | 简体中文</p>
 
 Player-Core 是 [NovaPlayer](https://github.com/wuuuming/NovaPlayer) 里负责出声的部分。它打开歌曲、解码，
-再播放到设备上：Windows 上通过 FFmpeg 和 WASAPI 或 ASIO，Linux 上通过系统的 FFmpeg 和 PulseAudio（或
+再播放到设备上：Windows 上通过 FFmpeg 和 WASAPI 或 ASIO，Linux 上通过随附的 FFmpeg 和 PulseAudio（或
 PipeWire 的 pulse 服务）。它自己没有界面，目前只有 NovaPlayer 一个宿主，但里面没有任何地方依赖 NovaPlayer。
 
 它做的事：
@@ -40,7 +40,7 @@ cargo build --release --features asio              # Windows，带 ASIO（需要
 python tools/ci.py                                 # CI 跑的内容：fmt、构建、clippy、单元测试
 ```
 
-Windows 上构建时链接仓库里的纯音频 FFmpeg（`crates/player-core/third_party/ffmpeg/`，FFmpeg c6bb22dea0，LGPL，五个 DLL，约 9 MB，由 `tools/ffmpeg-audio/build.sh` 从 FFmpeg 源码构建），并把 DLL 放到构建出的程序旁边；设置 `NOVA_MEDIA_NATIVE_DIR=<dir>` 可改用 `<dir>/ffmpeg-master-latest-win64-lgpl-shared/`（同一 ABI，avcodec-62）。Linux 运行时需要 `ffmpeg`、`ffprobe` 和 PulseAudio。
+Windows 上构建时链接仓库里的纯音频 FFmpeg（`crates/player-core/third_party/ffmpeg/`，FFmpeg c6bb22dea0，LGPL，五个 DLL，约 9 MB，由 `tools/ffmpeg-audio/build.sh` 从 FFmpeg 源码构建），并把 DLL 放到构建出的程序旁边；设置 `NOVA_MEDIA_NATIVE_DIR=<dir>` 可改用 `<dir>/ffmpeg-master-latest-win64-lgpl-shared/`（同一 ABI，avcodec-62）。Linux x86-64 使用同一版本的五个共享库，放在程序旁边；HTTPS 使用系统 GnuTLS 和证书库，输出用 libpulse，不需要 FFmpeg 命令行程序。
 
 ## 参与贡献
 

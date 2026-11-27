@@ -8,7 +8,10 @@ pub(super) const ERROR_CAPACITY: usize = 512;
 pub(super) const AVERROR_EOF: i32 = -541_478_725;
 pub(super) const AVERROR_EXIT: i32 = -1_414_092_869;
 pub(super) const AVERROR_INVALID_ARGUMENT: i32 = -22;
+#[cfg(windows)]
 pub(super) const AVERROR_NOT_SUPPORTED: i32 = -40;
+#[cfg(target_os = "linux")]
+pub(super) const AVERROR_NOT_SUPPORTED: i32 = -libc::ENOSYS;
 pub(super) const AVSEEK_SIZE: i32 = 0x10000;
 pub(super) const AVSEEK_FORCE: i32 = 0x20000;
 pub(super) const SEEK_SET: i32 = 0;

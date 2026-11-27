@@ -11,7 +11,7 @@
 
 Player-Core is the part of [NovaPlayer](https://github.com/wuuuming/NovaPlayer) that makes the
 sound. It opens a song, decodes it and plays it to a device: on Windows through FFmpeg and WASAPI
-or ASIO, on Linux through the system's FFmpeg and PulseAudio (or PipeWire's pulse server). It has
+or ASIO, on Linux through the bundled FFmpeg and PulseAudio (or PipeWire's pulse server). It has
 no UI of its own, and NovaPlayer is its only host so far, but nothing in it knows about NovaPlayer.
 
 What it does:
@@ -49,7 +49,7 @@ On Windows the build links the audio-only FFmpeg in `crates/player-core/third_pa
 (FFmpeg c6bb22dea0, LGPL, five DLLs, ~9 MB), which `tools/ffmpeg-audio/build.sh` makes from
 FFmpeg's source, and puts its DLLs next to the built binaries; set
 `NOVA_MEDIA_NATIVE_DIR=<dir>` to link `<dir>/ffmpeg-master-latest-win64-lgpl-shared/` instead
-(same ABI, avcodec-62). Linux needs `ffmpeg`, `ffprobe` and libpulse at run time. It lists sinks through libpulse and decodes stereo at the selected sink's rate.
+(same ABI, avcodec-62). Linux x86-64 links the same audio-only build as five replaceable shared libraries beside the binary. HTTPS uses GnuTLS and the system trust store. Playback needs libpulse, not FFmpeg command-line programs. It lists sinks through libpulse and decodes stereo at the selected sink's rate.
 
 ## Contributing
 

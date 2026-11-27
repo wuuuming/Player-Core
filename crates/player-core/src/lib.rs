@@ -50,6 +50,8 @@ mod tag_rule;
 #[cfg(any(windows, target_os = "linux"))]
 pub use media_tags::{AudioResolution, MediaTags};
 mod timing;
+#[cfg(any(windows, target_os = "linux"))]
+mod track;
 
 pub use replay_gain::ReplayGain;
 #[cfg(any(windows, target_os = "linux"))]
@@ -83,7 +85,7 @@ pub use timing::{
 #[cfg(windows)]
 mod audio;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod source;
 
 #[cfg(windows)]
@@ -160,11 +162,11 @@ pub use audio::{
     take_null_audio_output_callback_times, use_null_audio_output,
 };
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[cfg(feature = "instrument")]
 pub use source::{native_buffer_census, NativeBufferCensus};
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub use source::{UrlAudioSourceFactory, UrlMediaByteSource};
 
 /// Process-lifetime monotonic work counts, for measuring from outside (an idle player does no

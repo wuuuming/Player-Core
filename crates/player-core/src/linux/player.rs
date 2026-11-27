@@ -1,8 +1,9 @@
 use super::output::{capturing, NULL_OUTPUT};
-use super::source::is_network;
-use super::types::{AudioError, AudioErrorKind, TrackHint};
-use super::{playback, probe, process};
+use super::source::is_http_input;
+use super::types::{AudioError, AudioErrorKind};
+use super::{playback, probe};
 use crate::dsp::{song_end, within_end, ReplayGainSetting, UserGain};
+use crate::AudioTrackSelection;
 use crate::{AudioInput, AudioSourceFactory, ReplayGain, ReplayGainTags};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -19,17 +20,16 @@ pub(super) enum Terminal {
 }
 
 /// Writer-owned resources can outlive a cancelled controller until cleanup completes.
-/// Child cancellation and PCM feeder cancellation do not depend on that library returning.
+/// Source cancellation does not depend on the sound server returning.
 pub(super) struct Run {
     pub(super) stop: Arc<AtomicBool>,
     /// Set before `stop` when the player is disposed: the writer fades the sound out over the
     /// leave, not a pause's declick.
     pub(super) leaving: AtomicBool,
-    /// The cancellation tokens of the PCM feeders the run's decoders started, and the slots of
-    /// their children: one decoder, and a second while the next song's is started ahead.
-    feeds: Mutex<Vec<Arc<AtomicBool>>>,
+    /// A read blocked on a plugin or network source can outlive a controller's stop.
+    readers: Mutex<Vec<std::sync::Weak<dyn Fn() + Send + Sync>>>,
     cancelled: Arc<AtomicBool>,
-    children: Mutex<Vec<Arc<process::ChildSlot>>>,
+
     /// The song the player wants to follow this one (`AudioPlayer::set_next`), shared with it:
     /// the writer starts its decoder ahead and goes on into it at this one's end.
     pub(super) next: Arc<Mutex<Option<Arc<Following>>>>,
@@ -62,9 +62,9 @@ impl Run {
         Self {
             stop: Arc::new(AtomicBool::new(false)),
             leaving: AtomicBool::new(false),
-            feeds: Mutex::default(),
+            readers: Mutex::default(),
             cancelled,
-            children: Mutex::default(),
+
             next,
             boundaries: Mutex::default(),
             heard_us: AtomicU64::new(0),
@@ -86,49 +86,26 @@ impl Run {
             self.announce();
         }
     }
-    /// When the heard position, standing still from now on, would read as buffering; `None`
-    /// while it already does.
-    pub(super) fn stall_at(&self) -> Option<Instant> {
-        if self.buffering.load(Ordering::Acquire) {
-            return None;
+
+    pub(super) fn reading(&self, cancel: &Arc<dyn Fn() + Send + Sync>) {
+        let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
+        readers.retain(|r| r.strong_count() != 0);
+        readers.push(Arc::downgrade(cancel));
+        if self.cancelled() {
+            cancel();
         }
-        let progress = self.last_progress_us.load(Ordering::Relaxed);
-        Some(self.started + Duration::from_micros(progress + STALL_US + 1))
     }
-    /// A slot for a decoder's child, killed with the run.
-    pub(super) fn child_slot(&self) -> Arc<process::ChildSlot> {
-        let slot = Arc::<process::ChildSlot>::default();
-        self.children
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(slot.clone());
-        slot
-    }
-    /// A PCM feeder's token, stopped with the run.
-    pub(super) fn add_feed(&self, token: Arc<AtomicBool>) {
-        self.feeds
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(token);
-    }
-    /// Stops the run's feeders and kills its decoders. The writer sees `stop` and ends.
+
     fn terminate(&self) {
         self.stop.store(true, Ordering::Release);
-        for feed in self
-            .feeds
+        for cancel in self
+            .readers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
+            .filter_map(std::sync::Weak::upgrade)
         {
-            feed.store(true, Ordering::Release);
-        }
-        for child in self
-            .children
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-        {
-            child.terminate();
+            cancel();
         }
     }
     /// The writer went on into `song`, which starts at `at` of the heard time: the player is
@@ -195,7 +172,8 @@ fn cancel_flag(factory: &dyn AudioSourceFactory) -> Arc<AtomicBool> {
 pub(super) struct Following {
     pub(super) serial: u64,
     pub(super) id: u64,
-    pub(super) input: AudioInput,
+    pub(super) factory: Arc<dyn AudioSourceFactory>,
+    pub(super) track: AudioTrackSelection,
     pub(super) start: Duration,
     pub(super) stop: Option<Duration>,
     pub(super) duration: Option<Duration>,
@@ -221,7 +199,7 @@ pub struct AudioNext {
     /// gone on into it.
     pub id: u64,
     pub factory: Arc<dyn AudioSourceFactory>,
-    pub track: TrackHint,
+    pub track: AudioTrackSelection,
     /// Its length, as the host's tags probe read it: [`AudioPlayer::duration`] once it plays.
     pub duration: Option<Duration>,
     /// Where in its container it starts (a CUE track), zero for its beginning.
@@ -243,7 +221,7 @@ struct PlaybackRun {
 /// How a session opens: the Windows backend's options, less what this one has no use for.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AudioOpenOptions {
-    pub track: TrackHint,
+    pub track: AudioTrackSelection,
     /// The container's length, when the host's tags probe read it.
     pub duration: Option<Duration>,
     /// The source's own rate; this backend resamples to the sound server's anyway.
@@ -255,7 +233,8 @@ pub struct AudioOpenOptions {
 }
 
 pub struct AudioPlayer {
-    input: AudioInput,
+    factory: Arc<dyn AudioSourceFactory>,
+    track: AudioTrackSelection,
     /// Position at `since` (absolute in the file), and whether the clock runs. With sound,
     /// `at` is where the current run started and the run reports how much of it was heard.
     at: Duration,
@@ -287,7 +266,7 @@ pub struct AudioPlayer {
 impl AudioPlayer {
     pub fn open(
         factory: Arc<dyn AudioSourceFactory>,
-        track: TrackHint,
+        track: AudioTrackSelection,
         wake: Arc<dyn Fn() + Send + Sync>,
         duration: Option<Duration>,
     ) -> Result<Self, AudioError> {
@@ -309,20 +288,14 @@ impl AudioPlayer {
         if cancelled.load(Ordering::Acquire) {
             return Err(AudioError::new(AudioErrorKind::Cancelled, "open cancelled"));
         }
-        let input = factory.input().ok_or_else(|| {
-            AudioError::new(
-                AudioErrorKind::Source,
-                format!("{}: a byte-only source cannot play here", factory.label()),
-            )
-        })?;
-        match &input {
-            AudioInput::Path(p) if !is_network(&input) && !p.exists() => {
+        match factory.input() {
+            Some(AudioInput::Path(p)) if !is_http_input(&p) && !p.exists() => {
                 return Err(AudioError::new(
                     AudioErrorKind::Source,
                     format!("file not found: {}", p.display()),
                 ));
             }
-            AudioInput::Pcm(source) if !source.has_format() => {
+            Some(AudioInput::Pcm(source)) if !source.has_format() => {
                 return Err(AudioError::new(
                     AudioErrorKind::Source,
                     "PCM sample rate and channel count must not be zero",
@@ -330,7 +303,7 @@ impl AudioPlayer {
             }
             _ => {}
         }
-        let (duration, tags) = probe_input(&input, duration, &cancelled);
+        let (duration, tags) = probe_input(factory.as_ref(), duration, &cancelled);
         if cancelled.load(Ordering::Acquire) {
             return Err(AudioError::new(AudioErrorKind::Cancelled, "open cancelled"));
         }
@@ -339,7 +312,8 @@ impl AudioPlayer {
         let replay_gain = Arc::new(ReplayGainSetting::default());
         replay_gain.set(options.replay_gain);
         Ok(AudioPlayer {
-            input,
+            factory,
+            track: options.track,
             at: Duration::ZERO,
             since: Instant::now(),
             playing: false,
@@ -403,14 +377,22 @@ impl AudioPlayer {
             self.wake.clone(),
             self.next.clone(),
         ));
-        let (r, input, from) = (run.clone(), self.input.clone(), self.at);
+        let (r, factory, from, track) = (run.clone(), self.factory.clone(), self.at, self.track);
         let (_, limit) = span_to(from, self.end());
         let (tags, gain) = (self.tags, self.replay_gain.clone());
         let (effects, volume) = (self.effects.clone(), self.volume.clone());
         let h = std::thread::Builder::new()
             .name("pulse-out".into())
             .spawn(move || {
-                playback::write_run(r, &input, (from, limit), tags, gain, effects, volume)
+                playback::write_run(
+                    r,
+                    factory.as_ref(),
+                    (from, limit, track),
+                    tags,
+                    gain,
+                    effects,
+                    volume,
+                )
             })
             .map_err(|e| {
                 AudioError::new(
@@ -498,17 +480,15 @@ impl AudioPlayer {
             .name("audio-next".into())
             .spawn(move || {
                 let cancelled = cancel_flag(next.factory.as_ref());
-                // A byte-only source is not followed: this song ends as it would have.
-                let Some(input) = next.factory.input() else {
-                    return;
-                };
-                let (duration, tags) = probe_input(&input, next.duration, &cancelled);
+                let (duration, tags) =
+                    probe_input(next.factory.as_ref(), next.duration, &cancelled);
                 let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
                 if wanted.load(Ordering::Acquire) == serial && !cancelled.load(Ordering::Acquire) {
                     *slot = Some(Arc::new(Following {
                         serial,
                         id: next.id,
-                        input,
+                        factory: next.factory,
+                        track: next.track,
                         start: next.start,
                         stop: next.stop,
                         duration,
@@ -547,7 +527,8 @@ impl AudioPlayer {
             let Some((song, at)) = crossed else {
                 return;
             };
-            self.input = song.input.clone();
+            self.factory = song.factory.clone();
+            self.track = song.track;
             self.duration = song.duration;
             self.stop = song.stop;
             self.tags = song.tags;
@@ -712,16 +693,22 @@ mod tests;
 
 /// The length (the host's, else the input's own) and the ReplayGain tags of what `input` plays.
 fn probe_input(
-    input: &AudioInput,
+    factory: &dyn AudioSourceFactory,
     duration: Option<Duration>,
     cancelled: &AtomicBool,
 ) -> (Option<Duration>, ReplayGainTags) {
-    match input {
-        AudioInput::Pcm(source) => (
+    match factory.input() {
+        Some(AudioInput::Pcm(source)) => (
             duration.or_else(|| source.duration()),
             ReplayGainTags::default(),
         ),
-        AudioInput::Path(p) => probe::for_playback(p, duration, cancelled),
-        AudioInput::Url(u, _) => probe::for_playback(std::path::Path::new(u), duration, cancelled),
+        Some(AudioInput::Path(p)) => probe::for_playback(&p, duration, cancelled),
+        _ => factory
+            .open()
+            .ok()
+            .and_then(|bytes| super::tags::probe(bytes).ok())
+            .map_or((duration, ReplayGainTags::default()), |(tags, gain)| {
+                (duration.or(tags.duration), gain)
+            }),
     }
 }

@@ -5,12 +5,10 @@ use super::callback::frames_to_duration;
 use super::clock::AudioClock;
 use super::error::{AudioError, AudioOpenError, NativeError};
 use super::ffi::{
-    bn_audio_decoder_codec_name, bn_audio_decoder_decode_next, bn_audio_decoder_input_state,
-    bn_audio_decoder_open_source_stream_with_error, bn_audio_decoder_passed_over,
+    bn_audio_decoder_decode_next, bn_audio_decoder_input_state, bn_audio_decoder_passed_over,
     bn_audio_decoder_read_dsd, bn_audio_decoder_resampler_input_frames, bn_audio_decoder_seek,
-    bn_audio_decoder_set_source_local, bn_audio_decoder_transport_error, BnAudioChunk,
-    BnAudioStreamInfo, BnDsdChunk, NativeAudioDecoder, AUDIO_AGAIN, AUDIO_EOF,
-    BN_AUDIO_INVALID_STREAM,
+    bn_audio_decoder_transport_error, BnAudioChunk, BnAudioStreamInfo, BnDsdChunk,
+    NativeAudioDecoder, AUDIO_AGAIN, AUDIO_EOF, BN_AUDIO_INVALID_STREAM,
 };
 use super::metrics::SharedMetrics;
 use super::mix::MixStage;
@@ -26,7 +24,7 @@ use crate::{
 };
 use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::ptr::{self, NonNull};
+
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -833,71 +831,20 @@ pub(super) fn open_media_bytes(
 }
 
 pub(super) fn open_native_audio(
-    mut source: NativeMediaByteSource,
+    source: NativeMediaByteSource,
     audio_stream_index: i32,
     sample_rate: NonZeroU32,
     channels: u16,
 ) -> Result<(NativeAudioDecoder, BnAudioStreamInfo, String), AudioOpenError> {
-    let descriptor = source.descriptor();
-    let mut raw = ptr::null_mut();
-    let mut info = BnAudioStreamInfo::default();
-    let mut error = NativeMessage::new();
-    let mut native_code = 0;
-    // SAFETY: the descriptor's source lives in `source` until the decoder owns it; every
-    // out-parameter is a live local and the message buffer is given with its capacity.
-    let status = unsafe {
-        bn_audio_decoder_open_source_stream_with_error(
-            &descriptor,
-            audio_stream_index,
-            i32::try_from(sample_rate.get()).map_err(|_| {
-                AudioOpenError::InvalidOutputConfig(
-                    "cpal output sample rate exceeds the native ABI".to_owned(),
-                )
-            })?,
-            i32::from(channels),
-            &mut raw,
-            &mut info,
-            error.as_mut_ptr(),
-            error.capacity(),
-            &mut native_code,
-        )
-    };
-    if status != 0 {
-        // The C shim is the ONE validator of "is this index an audio stream" — it holds the
-        // container — so the Rust side does not open the resource a second time to pre-check.
-        // Its refusal is translated back into the taxonomy the caller asked in.
-        if status == BN_AUDIO_INVALID_STREAM {
+    let rate = i32::try_from(sample_rate.get()).map_err(|_| {
+        AudioOpenError::InvalidOutputConfig("cpal output sample rate exceeds the native ABI".into())
+    })?;
+    super::ffi::open_native_audio(source, audio_stream_index, rate, channels).map_err(|e| {
+        if e.status == BN_AUDIO_INVALID_STREAM {
             if let Some(stream_index) = AudioStreamIndex::new(audio_stream_index) {
-                return Err(AudioOpenError::SelectedTrackUnavailable { stream_index });
+                return AudioOpenError::SelectedTrackUnavailable { stream_index };
             }
         }
-        return Err(AudioOpenError::Native(NativeError {
-            operation: "open",
-            status,
-            transport: native_code,
-            message: error.message(),
-        }));
-    }
-    let decoder = NativeAudioDecoder {
-        raw: NonNull::new(raw).ok_or_else(|| {
-            AudioOpenError::Native(NativeError {
-                operation: "open",
-                status: 0,
-                transport: 0,
-                message: "the shim returned no decoder".to_owned(),
-            })
-        })?,
-        _source: source,
-        dsd: false,
-    };
-    // Before the first read: it sizes how far ahead the sound's input is read.
-    // SAFETY: the decoder just opened, owned by `decoder`.
-    unsafe {
-        bn_audio_decoder_set_source_local(decoder.raw.as_ptr(), decoder._source.native_locality())
-    };
-    // SAFETY: the decoder just opened; the name, when not null, is a NUL-terminated string the
-    // decoder owns, copied here before anything else touches the decoder.
-    let codec = unsafe { crate::c_text(bn_audio_decoder_codec_name(decoder.raw.as_ptr())) }
-        .unwrap_or_else(|| "unknown".to_owned());
-    Ok((decoder, info, codec))
+        AudioOpenError::Native(e)
+    })
 }

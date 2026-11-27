@@ -10,10 +10,7 @@ const WINDOWS_TYPES: &[(&str, &str)] = &[
     // Linux reports an open's failure as any other playback error.
     ("AudioOpenError", "AudioError"),
 ];
-const LINUX_TYPES: &[(&str, &str)] = &[
-    // Windows picks one of a file's audio streams; Linux plays FFmpeg's default one.
-    ("TrackHint", "AudioTrackSelection"),
-];
+const LINUX_TYPES: &[(&str, &str)] = &[];
 
 /// What only the Windows player has.
 const WINDOWS_ONLY: &[&str] = &[
@@ -21,8 +18,9 @@ const WINDOWS_ONLY: &[&str] = &[
     // sound server's rate.
     "fn set_playback_rate",
     "fn playback_rate",
-    // The decoder's stream description, the callback metrics and the WASAPI timing policy belong
-    // to the Windows output path.
+    // The Windows description includes the bound endpoint's cpal format. The Linux
+    // writer binds asynchronously after open; it has no borrowed binding description.
+    // Callback metrics and WASAPI timing policy also belong to the Windows output.
     "fn stream_info",
     "fn metrics",
     "fn policy",

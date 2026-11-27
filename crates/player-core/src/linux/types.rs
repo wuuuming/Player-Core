@@ -13,6 +13,19 @@ pub struct AudioError {
     message: String,
 }
 
+impl From<crate::source::NativeError> for AudioError {
+    fn from(error: crate::source::NativeError) -> Self {
+        Self::new(
+            if error.is_network_failure() {
+                AudioErrorKind::Transport
+            } else {
+                AudioErrorKind::Decoder
+            },
+            error.to_string(),
+        )
+    }
+}
+
 impl AudioError {
     pub(super) fn new(kind: AudioErrorKind, message: impl Into<String>) -> Self {
         Self {
@@ -39,7 +52,3 @@ impl std::fmt::Display for AudioError {
         f.write_str(&self.message)
     }
 }
-
-/// player-core's per-track hint; nothing to say here.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TrackHint;

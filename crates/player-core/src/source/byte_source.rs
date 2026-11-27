@@ -271,10 +271,14 @@ impl NativeMediaByteSource {
     }
 
     pub(crate) fn new(source: Box<dyn MediaByteSource>) -> Self {
+        #[cfg(windows)]
         use std::os::windows::ffi::OsStrExt;
+        #[cfg(windows)]
         let path = source
             .local_path()
             .map(|path| path.as_os_str().encode_wide().chain(Some(0)).collect());
+        #[cfg(not(windows))]
+        let path = None;
         Self {
             path,
             canceller: source.canceller(),

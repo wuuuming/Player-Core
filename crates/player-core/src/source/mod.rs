@@ -11,6 +11,7 @@ mod ffi;
 
 pub(crate) use self::byte_source::NativeMediaByteSource;
 pub use self::byte_source::{UrlAudioSourceFactory, UrlMediaByteSource};
+pub use self::error::NativeError;
 pub(crate) use self::error::{native_is_network_failure, source_is_network_failure, NativeMessage};
 pub(crate) use self::ffi::BnByteSource;
 #[cfg(feature = "instrument")]

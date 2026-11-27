@@ -4,8 +4,7 @@ The same chains on both platforms (`src/dsp.rs`): PCM runs through `DspStage`s (
 `reset`, `latency`) in blocks of at most `DSP_MAX_BLOCK_FRAMES`, reset on seek, a stage's latency
 taken out of the timeline and its tail flushed at the end. On Windows the decode worker runs them
 between the decoder and the ring (DSD bypasses them; the stream's chain sits with the ring, in
-`audio/stream.rs`); on Linux the Pulse writer runs them between FFmpeg's pipe (48 kHz stereo
-`f32le`) and the `float32le` stream.
+`audio/stream.rs`); on Linux the Pulse writer runs them between in-process FFmpeg (stereo `f32le` at the sink's rate) and the `float32le` stream.
 
 Two chains, by what they belong to. A song's own (`song_chain`) is its ReplayGain
 (`AudioOpenOptions::replay_gain`, `AudioPlayer::set_replay_gain`): track or album gain from the
@@ -21,7 +20,7 @@ smoothed per frame: in the device callback on Windows, after the chains on Linux
 its length, a CUE span). It is opened ahead and continues the same stream at the sample after
 this one's last: on Windows a second decoder (thread `player-core-audio-next`) is handed to the
 decode worker, which switches to it in the same ring at the first song's end or stop bound; on
-Linux the writer starts the next FFmpeg child ahead and splices its output in at the first one's
+Linux the writer starts the next decoder ahead and splices its output in at the first one's
 EOF. FFmpeg trims each codec's delay and padding (LAME header, MP4 edit list), so the joint is
 sample-exact (checked in the private test suite against generated fixtures). The next
 song has its own ReplayGain; the effects go on across the boundary as within a song, not reset
@@ -35,7 +34,7 @@ out of them, then they are reset and take up the change. The volume carries on.
 with an overlap of more than nothing. The overlap ends where this song ends as known ahead — its
 stop, else the length the host gave — so a song whose end is not known, and a DSD one, is followed
 gaplessly. At the overlap's start the going song's decoder plays on beside the coming one's: on
-Windows into a ring of its own (`StreamWriter::begin_fade`), on Linux from its FFmpeg child read
+Windows into a ring of its own (`StreamWriter::begin_fade`), on Linux from its decoder read
 alongside. Each goes through its own chain (its own ReplayGain), the two are summed under
 equal-power gains (`dsp::Crossfade`: cos and sin of a quarter turn over the span), and the sum
 goes on through the stream's chain and the volume. The coming song is taken only as far as the

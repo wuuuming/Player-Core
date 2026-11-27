@@ -1,186 +1,20 @@
-//! Decoder and PCM feeder lifetime, separate from the player's persistent state, and the
-//! processing between FFmpeg's pipe and the stream (the chains Windows runs).
+//! Native decoding and the two processing chains before the sound server.
+use super::ffi::*;
 use super::output::{capturing, Capture, ROUTE, ROUTE_VERSION};
 use super::player::{Following, Run, Terminal};
-use super::source::{ffmpeg_input, is_network};
+use super::pulse;
 use super::types::{AudioError, AudioErrorKind};
-use super::{process, pulse};
 use crate::dsp::{
     handover_at, song_chain, stream_chain, Crossfade, DspChain, ReplayGainSetting, UserGain,
 };
 use crate::dsp::{one_pole, one_pole_coefficient, USER_GAIN_SMOOTHING};
-use crate::{AudioInput, PcmSource};
-use std::io::{Read, Write};
+use crate::source::{NativeError, NativeMediaByteSource, NativeMessage};
+use crate::{AudioSourceFactory, AudioTrackSelection};
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-struct Decoder {
-    child: process::OwnedChild,
-    /// The PCM feeder's own token: stopped when this decoder finishes, and with the run.
-    feed_stop: Arc<AtomicBool>,
-    feeder: Option<std::thread::JoinHandle<()>>,
-    feed_error: Arc<Mutex<Option<AudioError>>>,
-    stderr: Option<process::StderrTail>,
-}
-
-impl Decoder {
-    fn finish_feeder(&mut self) {
-        self.feed_stop.store(true, Ordering::Release);
-        // read() uses the feeder token, pipe writes are nonblocking. No orphan plugin readers.
-        if let Some(feeder) = self.feeder.take() {
-            if feeder.join().is_err() {
-                let mut error = self
-                    .feed_error
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                error.get_or_insert_with(|| {
-                    AudioError::new(AudioErrorKind::Source, "PCM reader thread stopped")
-                });
-            }
-        }
-    }
-
-    fn finish(&mut self) -> (Option<AudioError>, String) {
-        self.child.terminate();
-        self.finish_feeder();
-        let log = self
-            .stderr
-            .take()
-            .map_or_else(String::new, |mut stderr| stderr.finish());
-        (
-            self.feed_error
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone(),
-            log,
-        )
-    }
-}
-
-impl Drop for Decoder {
-    fn drop(&mut self) {
-        self.finish();
-    }
-}
-
-fn feed(
-    source: Arc<dyn PcmSource>,
-    mut stdin: std::process::ChildStdin,
-    (run, feed_stop): (Arc<Run>, Arc<AtomicBool>),
-    error: Arc<Mutex<Option<AudioError>>>,
-    from: Duration,
-) {
-    let mut at = (from.as_secs_f64() * f64::from(source.sample_rate())) as u64;
-    let cancelled = || run.cancelled() || feed_stop.load(Ordering::Acquire);
-    while !cancelled() {
-        let bytes = match source.read_cancellable(at, 4800, &feed_stop) {
-            Ok(bytes) if bytes.is_empty() => return,
-            Ok(bytes) => bytes,
-            Err(message) => {
-                if !cancelled() {
-                    // A host source returns text, not a typed network status. Preserve it,
-                    // but never guess that arbitrary source/decode failures are transport.
-                    *error.lock().unwrap_or_else(PoisonError::into_inner) =
-                        Some(AudioError::new(AudioErrorKind::Source, message));
-                }
-                return;
-            }
-        };
-        at += bytes.len() as u64 / source.frame_bytes();
-        let mut written = 0;
-        while written < bytes.len() && !cancelled() {
-            match stdin.write(&bytes[written..]) {
-                Ok(0) => return,
-                Ok(n) => written += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                // Until ffmpeg takes more (or exits: a hung-up pipe is ready too). The deadline
-                // only bounds how late a stop asked without killing ffmpeg is seen.
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    let until = Instant::now() + process::IO_TIMEOUT;
-                    if process::ready_one(&stdin, libc::POLLOUT, Some(until)).is_err() {
-                        return;
-                    }
-                }
-                // ffmpeg may have reached a span's -t limit. Its exit status decides success.
-                Err(_) => return,
-            }
-        }
-    }
-}
-
-/// The ffmpeg CLI exposes no typed AVERROR. Match only explicit transport diagnostics in
-/// its C-locale stderr, never "HTTP input => network error" or generic "Input/output error".
-/// Ambiguous failures stay decoder errors; auth and invalid media always veto retries.
-fn transport_log(log: &str) -> bool {
-    let log = log.to_ascii_lowercase();
-    !non_transport_log(&log)
-        && [
-            "connection reset by peer",
-            "connection timed out",
-            "connection refused",
-            "network is unreachable",
-            "network is down",
-            "no route to host",
-            "temporary failure in name resolution",
-            "failed to resolve hostname",
-            "stream ends prematurely",
-        ]
-        .iter()
-        .any(|text| log.contains(text))
-}
-
-fn non_transport_log(log: &str) -> bool {
-    [
-        "401 unauthorized",
-        "403 forbidden",
-        "404 not found",
-        "http error 4",
-        "server returned 4",
-        "invalid data found when processing input",
-        "error while decoding",
-        "invalid pcm packet",
-        "error initializing output stream",
-        "error initializing output file",
-        "error opening output",
-        "decoder not found",
-        "unknown decoder",
-        "permission denied",
-        "certificate verification failed",
-    ]
-    .iter()
-    .any(|text| log.contains(text))
-}
-
-pub(super) fn decoder_error(
-    log: String,
-    http: bool,
-    transport_watchdog: bool,
-    fallback: String,
-) -> AudioError {
-    // A generic stdout/PCM stall is not a transport watchdog: decoding/probing can stall
-    // too. Only an independently confirmed transport timeout may use the no-log fallback.
-    // Nonempty, unrecognized diagnostics never become transport merely because of a timer.
-    let network = http && (transport_log(&log) || (transport_watchdog && log.trim().is_empty()));
-    let message = if !log.trim().is_empty() {
-        log
-    } else if network && transport_watchdog {
-        "network stream lost".into()
-    } else {
-        fallback
-    };
-    AudioError::new(
-        if network {
-            AudioErrorKind::Transport
-        } else {
-            AudioErrorKind::Decoder
-        },
-        message,
-    )
-}
-
-/// The stereo channels every stream uses.
 pub const CHAIN_CHANNELS: NonZeroUsize = match NonZeroUsize::new(pulse::CHANNELS as usize) {
     Some(channels) => channels,
     None => panic!("the stream has channels"),
@@ -193,7 +27,7 @@ pub const FRAME_BYTES: usize = pulse::FRAME_BYTES as usize;
 // short fade. The Windows backend's provisional policy's `ramp` and `leave` are the same.
 use crate::dsp::{DECLICK, LEAVE};
 
-/// What a run does to the sound between FFmpeg's pipe and the stream: the song's own chain, the
+/// What a run does to the sound between the decoded block and the stream: the song's own chain, the
 /// stream's (which every song of the run goes through, one after another), then the user's
 /// volume, moved to frame by frame over [`USER_GAIN_SMOOTHING`] as on Windows. Where a song
 /// overlaps the end of the one before (a crossfade), the two are summed before the stream's chain,
@@ -498,7 +332,7 @@ fn drain_output(run: &Run, out: &mut Sink, written: u64) -> Result<(), AudioErro
     // Look again when the estimate says the tail is down to `DRAIN_AT`, and at most until the
     // initial estimated tail (capped) has passed, never renewing that deadline on tiny timing
     // corrections. Only drain's acknowledgement confirms the actual EOF.
-    let tail = Duration::from_micros(sample_output(run, out, written)?).min(process::IO_TIMEOUT);
+    let tail = Duration::from_micros(sample_output(run, out, written)?).min(Duration::from_secs(5));
     let until = Instant::now() + tail;
     while !run.cancelled() {
         let remaining = Duration::from_micros(sample_output(run, out, written)?);
@@ -514,79 +348,6 @@ fn drain_output(run: &Run, out: &mut Sink, written: u64) -> Result<(), AudioErro
     Ok(())
 }
 
-/// The decoder: `ffmpeg` reading `input` (the host's PCM on its stdin) from `from` for at most
-/// `limit`, writing sink-rate stereo `f32le` to its stdout. An address's requests carry its headers
-/// and agent.
-pub fn decoder_command(
-    input: &AudioInput,
-    (from, limit): (Duration, Option<Duration>),
-    rate: NonZeroU32,
-) -> std::process::Command {
-    let mut cmd = std::process::Command::new("ffmpeg");
-    // Decode errors must not be silently accepted as successful (possibly premature) EOF.
-    cmd.env("LC_ALL", "C").arg("-xerror");
-    match input {
-        AudioInput::Pcm(s) => {
-            cmd.args([
-                "-v",
-                "error",
-                "-f",
-                "s16le",
-                "-ar",
-                &s.sample_rate().to_string(),
-                "-ac",
-                &s.channels().to_string(),
-                "-i",
-                "pipe:0",
-            ]);
-        }
-        _ => {
-            if is_network(input) {
-                cmd.args(["-rw_timeout", "5000000"]);
-            }
-            if let AudioInput::Url(_, http) = input {
-                if let Some(agent) = &http.user_agent {
-                    cmd.arg("-user_agent").arg(agent);
-                }
-                if let Some(block) = http.header_block() {
-                    cmd.arg("-headers").arg(block);
-                }
-            }
-            cmd.args([
-                "-v",
-                "error",
-                "-nostdin",
-                "-ss",
-                &format!("{:.6}", from.as_secs_f64()),
-                "-i",
-            ]);
-            cmd.args(ffmpeg_input(input));
-        }
-    }
-    if let Some(limit) = limit {
-        cmd.args(["-t", &format!("{:.6}", limit.as_secs_f64())]);
-    }
-    cmd.args([
-        "-vn",
-        "-ac",
-        &pulse::CHANNELS.to_string(),
-        "-ar",
-        &rate.to_string(),
-        "-f",
-        "f32le",
-        "-",
-    ])
-    .stdin(if matches!(input, AudioInput::Pcm(_)) {
-        std::process::Stdio::piped()
-    } else {
-        std::process::Stdio::null()
-    })
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped());
-    cmd
-}
-
-/// Where a run's sound goes: the sound server's stream, or the capture a test listens to.
 pub(super) enum Sink {
     Pulse(pulse::Stream),
     Capture(Capture),
@@ -643,118 +404,189 @@ impl Sink {
     }
 }
 
-/// A decoder of `path` (or the host's `pcm`) over `span`, its child and feeder stopped with `r`,
-/// and its nonblocking stdout. `None` when the run was cancelled meanwhile.
-fn start_decoder(
-    r: &Arc<Run>,
-    input: &AudioInput,
-    span: (Duration, Option<Duration>),
-    rate: NonZeroU32,
-) -> Result<Option<(Decoder, std::process::ChildStdout)>, AudioError> {
-    let decoder_io = |e| AudioError::new(AudioErrorKind::Decoder, format!("ffmpeg: {e}"));
-    let mut cmd = decoder_command(input, span, rate);
-    let pcm: Option<Arc<dyn PcmSource>> = match input {
-        AudioInput::Pcm(s) => Some(s.clone()),
-        _ => None,
-    };
-    let mut child = cmd.spawn().map_err(decoder_io)?;
-    let stdin = child.stdin.take();
-    #[allow(
-        clippy::expect_used,
-        reason = "the child was spawned with piped stdout"
-    )]
-    let pipe = child.stdout.take().expect("piped stdout");
-    #[allow(
-        clippy::expect_used,
-        reason = "the child was spawned with piped stderr"
-    )]
-    let stderr = child.stderr.take().expect("piped stderr");
-    let feed_stop = pcm.as_ref().map_or_else(
-        || Arc::new(AtomicBool::new(false)),
-        |source| source.reader_token(),
-    );
-    r.add_feed(feed_stop.clone());
-    let mut decoder = Decoder {
-        child: process::OwnedChild::install(child, r.child_slot()),
-        feed_stop,
-        feeder: None,
-        feed_error: Arc::new(Mutex::new(None)),
-        stderr: None,
-    };
-    if r.cancelled() {
-        return Ok(None);
-    }
-    decoder.stderr = Some(process::StderrTail::start(stderr).map_err(decoder_io)?);
-    process::nonblocking(&pipe).map_err(decoder_io)?;
-    if let (Some(source), Some(stdin)) = (pcm, stdin) {
-        process::nonblocking(&stdin).map_err(decoder_io)?;
-        let tokens = (r.clone(), decoder.feed_stop.clone());
-        let error = decoder.feed_error.clone();
-        let feeder = std::thread::Builder::new()
-            .name("pcm-feed".into())
-            .spawn(move || feed(source, stdin, tokens, error, span.0))
-            .map_err(|e| AudioError::new(AudioErrorKind::Source, e.to_string()))?;
-        decoder.feeder = Some(feeder);
-    }
-    Ok(Some((decoder, pipe)))
-}
-
-/// The next song's decoder, started ahead: it waits on its full pipe until this song's ends.
+/// The next song's decoder, ready to take over the stream.
 struct Ahead {
     song: Arc<Following>,
     reading: Reading,
 }
 
-/// A decoder being read: its child and nonblocking stdout, whether it reads from the network,
-/// the bytes its span is to give (as known ahead) and those read of them, and when it last gave
-/// any. Started together, replaced together.
+/// One decoder's PCM over its selected span; a native chunk can straddle writer blocks.
 struct Reading {
-    /// Dropped, it reaps the child and its feeder.
-    decoder: Decoder,
-    pipe: std::process::ChildStdout,
-    http: bool,
+    decoder: NativeAudioDecoder,
     length: Option<Duration>,
     read: u64,
-    last_read: Instant,
+    limit: Option<u64>,
+    pending: Vec<u8>,
+    offset: usize,
+    timing: crate::StreamTiming,
+    target: Option<Duration>,
+    rate: u32,
+    _cancel: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Reading {
-    /// A decoder of `input` over `span` started; `None` when the run was cancelled meanwhile.
     fn start(
-        r: &Arc<Run>,
-        input: &AudioInput,
-        span: (Duration, Option<Duration>),
+        cancel_read: impl FnOnce(&Arc<dyn Fn() + Send + Sync>),
+        factory: &dyn AudioSourceFactory,
+        span: (Duration, Option<Duration>, AudioTrackSelection),
         rate: NonZeroU32,
-    ) -> Result<Option<Self>, AudioError> {
-        Ok(
-            start_decoder(r, input, span, rate)?.map(|(decoder, pipe)| Self {
-                decoder,
-                pipe,
-                http: is_network(input),
-                length: span.1,
-                read: 0,
-                last_read: Instant::now(),
-            }),
-        )
+    ) -> Result<Self, AudioError> {
+        let source = factory.open().map_err(|e| {
+            AudioError::new(
+                if crate::source::source_is_network_failure(&e) {
+                    AudioErrorKind::Transport
+                } else {
+                    AudioErrorKind::Source
+                },
+                e.to_string(),
+            )
+        })?;
+        let cancel = source.canceller();
+        if let Some(c) = &cancel {
+            cancel_read(c);
+        }
+        let (decoder, info, _) = open_native_audio(
+            NativeMediaByteSource::new(source),
+            crate::track::requested_stream_index(span.2),
+            i32::try_from(rate.get())
+                .map_err(|e| AudioError::new(AudioErrorKind::Output, e.to_string()))?,
+            pulse::CHANNELS as u16,
+        )?;
+        let time_base = crate::StreamTimeBase {
+            numerator: info.time_base_num,
+            denominator: info.time_base_den,
+        };
+        let start_time = (info.has_start_time != 0).then_some(info.start_time);
+        let timing = crate::StreamTiming {
+            time_base,
+            start_time,
+            presentation_offset_nanoseconds: crate::presentation_offset_nanoseconds(
+                time_base,
+                start_time,
+                (info.has_format_start_time != 0).then_some(info.format_start_time_us),
+            )
+            .map_err(|e| AudioError::new(AudioErrorKind::Decoder, e.to_string()))?,
+        };
+        let reading = Self {
+            decoder,
+            length: span.1,
+            read: 0,
+            limit: span.1.map(|d| pulse::duration_to_bytes(d, rate.get())),
+            pending: Vec::new(),
+            offset: 0,
+            timing,
+            target: (!span.0.is_zero()).then_some(span.0),
+            rate: rate.get(),
+            _cancel: cancel,
+        };
+        if let Some(at) = reading.target {
+            let pts = crate::raw_timestamp_for_position(at, timing)
+                .map_err(|e| AudioError::new(AudioErrorKind::Decoder, e.to_string()))?;
+            let mut error = NativeMessage::new();
+            // SAFETY: reading owns the decoder; the message buffer is live for the call.
+            let status = unsafe {
+                bn_audio_decoder_seek(
+                    reading.decoder.raw.as_ptr(),
+                    pts,
+                    error.as_mut_ptr(),
+                    error.capacity(),
+                )
+            };
+            if status != 0 {
+                return Err(reading.failure("seek", status, error));
+            }
+        }
+        Ok(reading)
+    }
+    fn failure(&self, operation: &'static str, status: i32, error: NativeMessage) -> AudioError {
+        // SAFETY: this reader owns the live decoder.
+        let transport = unsafe { bn_audio_decoder_transport_error(self.decoder.raw.as_ptr()) };
+        NativeError {
+            operation,
+            status,
+            transport,
+            message: error.message(),
+        }
+        .into()
+    }
+    /// None while the demuxer awaits input; zero at the end of this span.
+    fn read(&mut self, to: &mut [u8]) -> Result<Option<usize>, AudioError> {
+        let left = self.limit.map_or(usize::MAX, |n| {
+            usize::try_from(n.saturating_sub(self.read)).unwrap_or(usize::MAX)
+        });
+        if left == 0 {
+            return Ok(Some(0));
+        }
+        while self.offset == self.pending.len() {
+            let mut chunk = BnAudioChunk::default();
+            let mut error = NativeMessage::new();
+            // SAFETY: decoder, out-parameter and message buffer live throughout the call.
+            let status = unsafe {
+                bn_audio_decoder_decode_next(
+                    self.decoder.raw.as_ptr(),
+                    &mut chunk,
+                    error.as_mut_ptr(),
+                    error.capacity(),
+                )
+            };
+            match status {
+                AUDIO_AGAIN => return Ok(None),
+                AUDIO_EOF => return Ok(Some(0)),
+                0 => {}
+                _ => return Err(self.failure("decode", status, error)),
+            }
+            let frames = usize::try_from(chunk.frames)
+                .map_err(|e| AudioError::new(AudioErrorKind::Decoder, e.to_string()))?;
+            if frames == 0 || chunk.samples.is_null() {
+                continue;
+            }
+            let skip = match self.target {
+                Some(target) if chunk.timing.has_timestamp != 0 => {
+                    let ts = crate::normalize_timestamp(chunk.timing.pts, self.timing)
+                        .map_err(|e| AudioError::new(AudioErrorKind::Decoder, e.to_string()))?;
+                    let ns = (target.as_nanos() as i128 - ts.as_nanoseconds()).max(0) as u128;
+                    usize::try_from((ns * u128::from(self.rate)).div_ceil(1_000_000_000))
+                        .unwrap_or(usize::MAX)
+                        .min(frames)
+                }
+                _ => 0,
+            };
+            if skip == frames {
+                continue;
+            }
+            self.target = None;
+            // SAFETY: one interleaved stereo f32 block, borrowed only until the next decoder call.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(chunk.samples.cast::<u8>(), frames * FRAME_BYTES)
+            };
+            self.pending.clear();
+            self.pending.extend_from_slice(&bytes[skip * FRAME_BYTES..]);
+            self.offset = 0;
+        }
+        let n = left.min(to.len()).min(self.pending.len() - self.offset);
+        to[..n].copy_from_slice(&self.pending[self.offset..self.offset + n]);
+        self.offset += n;
+        self.read += n as u64;
+        Ok(Some(n))
     }
 }
 
-/// `ffmpeg` decodes to sink-rate stereo `f32le`; `processing` takes it to the stream. This worker
-/// owns the cancellable PulseAudio event loop; controllers cancel children/feeds but never wait
+/// The decoder gives sink-rate stereo PCM; `processing` takes it to the stream. This worker
+/// owns the cancellable PulseAudio event loop; controllers interrupt source reads but never wait
 /// for output cleanup.
 ///
 /// The song the player wants next (`Run::next`) has its decoder started ahead; at this one's end
 /// the writer goes on into it, in the same stream, its first frame right after this one's last.
 pub(super) fn write_run(
     r: Arc<Run>,
-    input: &AudioInput,
-    span: (Duration, Option<Duration>),
+    factory: &dyn AudioSourceFactory,
+    span: (Duration, Option<Duration>, AudioTrackSelection),
     tags: crate::ReplayGainTags,
     gain: Arc<ReplayGainSetting>,
     effects: Option<crate::clap::Effects>,
     volume: Arc<UserGain>,
 ) {
-    if let Some(mut writer) = Writer::start(r, input, span, tags, gain, effects, volume) {
+    if let Some(mut writer) = Writer::start(r, factory, span, tags, gain, effects, volume) {
         while writer.pass().is_ok() {}
         writer.close();
     }
@@ -794,8 +626,8 @@ impl Writer {
     /// either failed (the failure reported).
     fn start(
         r: Arc<Run>,
-        input: &AudioInput,
-        span: (Duration, Option<Duration>),
+        factory: &dyn AudioSourceFactory,
+        span: (Duration, Option<Duration>, AudioTrackSelection),
         tags: crate::ReplayGainTags,
         gain: Arc<ReplayGainSetting>,
         effects: Option<crate::clap::Effects>,
@@ -804,7 +636,7 @@ impl Writer {
         if r.cancelled() {
             return None;
         }
-        let what = input.name();
+        let what = factory.label();
         let cancel: Arc<dyn Fn() -> bool + Send + Sync> = {
             let run = r.clone();
             Arc::new(move || run.cancelled())
@@ -824,9 +656,8 @@ impl Writer {
         let song = song_chain(gain.clone(), tags, rate, CHAIN_CHANNELS);
         let stream = stream_chain(effects.as_ref(), rate, CHAIN_CHANNELS);
         let processing = Processing::new(Arc::new(Mutex::new(song)), stream, volume, rate);
-        let reading = match Reading::start(&r, input, span, rate) {
-            Ok(Some(started)) => started,
-            Ok(None) => return None,
+        let reading = match Reading::start(|c| r.reading(c), factory, span, rate) {
+            Ok(started) => started,
             Err(error) => {
                 r.fail(error);
                 return None;
@@ -849,7 +680,7 @@ impl Writer {
         })
     }
 
-    /// One pass: the song wanted next, the output route, then one read of the decoder's pipe.
+    /// One pass: the song wanted next, the output route, then one block from the decoder.
     fn pass(&mut self) -> Result<(), Done> {
         if self.r.cancelled() {
             return Err(Done);
@@ -868,12 +699,14 @@ impl Writer {
         if end == self.fill {
             return self.hand_over();
         }
-        match self.reading.pipe.read(&mut self.buf[self.fill..end]) {
-            Ok(0) => self.song_end(),
-            Ok(n) => self.took(n),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.wait(),
-            Err(e) => Err(self.decoder_failed(format!("ffmpeg: {e}"))),
+        match self.reading.read(&mut self.buf[self.fill..end]) {
+            Ok(Some(0)) => self.song_end(),
+            Ok(Some(n)) => self.took(n),
+            Ok(None) => {
+                sample_output(&self.r, &mut self.out, self.written).map_err(|e| self.fail(e))?;
+                Ok(())
+            }
+            Err(e) => Err(self.fail(e)),
         }
     }
 
@@ -895,9 +728,14 @@ impl Writer {
         let Some(song) = wanted else {
             return Ok(());
         };
-        match Reading::start(&self.r, &song.input, song.span(), self.out.rate()) {
-            Ok(Some(reading)) => self.ahead = Some(Ahead { song, reading }),
-            Ok(None) => return Err(Done),
+        let (at, len) = song.span();
+        match Reading::start(
+            |c| self.r.reading(c),
+            song.factory.as_ref(),
+            (at, len, song.track),
+            self.out.rate(),
+        ) {
+            Ok(reading) => self.ahead = Some(Ahead { song, reading }),
             // Not followed: this song ends as it would have.
             Err(_) => self.refused = song.serial,
         }
@@ -917,9 +755,8 @@ impl Writer {
 
     /// `n` more bytes from the decoder: a full buffer goes through the processing to the stream.
     fn took(&mut self, n: usize) -> Result<(), Done> {
-        self.reading.last_read = Instant::now();
         self.fill += n;
-        self.reading.read += n as u64;
+
         if self.fill < self.buf.len() {
             return Ok(());
         }
@@ -940,49 +777,9 @@ impl Writer {
         Ok(())
     }
 
-    /// The decoder stopped: the run fails with its feeder's error, else with what its log says
-    /// (`fallback` when it says nothing).
-    fn decoder_failed(&mut self, fallback: String) -> Done {
-        let (feed_error, log) = self.reading.decoder.finish();
-        self.fail(
-            feed_error.unwrap_or_else(|| decoder_error(log, self.reading.http, false, fallback)),
-        )
-    }
-
-    /// The decoder has nothing yet: wait for it, or for the next thing due without it.
-    fn wait(&mut self) -> Result<(), Done> {
-        let latency = sample_output(&self.r, &mut self.out, self.written)
-            .map(Duration::from_micros)
-            .map_err(|e| self.fail(e))?;
-        if self.reading.last_read.elapsed() >= output_timeout(self.reading.http) {
-            return Err(self.decoder_failed("ffmpeg PCM output timed out".into()));
-        }
-        // Until ffmpeg writes (or exits), or the next thing due without it: the output has played
-        // out what it holds (the heard position stops there), the stall reads as buffering, the
-        // output guard, a look for the song wanted next.
-        let now = Instant::now();
-        let mut until =
-            (self.reading.last_read + output_timeout(self.reading.http)).min(now + NEXT_LOOK);
-        if latency > DRAIN_AT {
-            until = until.min(now + latency);
-        }
-        if let Some(stall) = self.r.stall_at() {
-            until = until.min(stall);
-        }
-        let until = until.max(now + Duration::from_millis(1));
-        process::ready_one(&self.reading.pipe, libc::POLLIN, Some(until)).map_err(|e| {
-            self.fail(AudioError::new(
-                AudioErrorKind::Decoder,
-                format!("ffmpeg: {e}"),
-            ))
-        })?;
-        Ok(())
-    }
-
-    /// The decoder's pipe closed: the song's last frames out, then on into the next song, or the
+    /// The decoder reached the end of its span: the song's last frames out, then on into the next song, or the
     /// stream drained and the run at its end.
     fn song_end(&mut self) -> Result<(), Done> {
-        self.settle_decoder()?;
         self.write_song_tail()?;
         // The next song, ready: on into it, its first frame right after this one's last (still
         // inside the stream's chain, the frames it holds), and the player told where that is
@@ -1070,10 +867,7 @@ impl Writer {
         );
         self.followed = next.song.serial;
         self.fill = 0;
-        let mut gone = std::mem::replace(&mut self.reading, next.reading);
-        let now = Instant::now();
-        self.reading.last_read = now;
-        gone.last_read = now;
+        let gone = std::mem::replace(&mut self.reading, next.reading);
         Ok(Going {
             reading: gone,
             buf: Vec::new(),
@@ -1089,73 +883,20 @@ impl Writer {
         let wanted = self.processing.going_wanted(self.buf.len() / FRAME_BYTES) * FRAME_BYTES;
         let start = going.buf.len();
         going.buf.resize(start + wanted, 0);
-        let read = going.reading.pipe.read(&mut going.buf[start..]);
-        going.buf.truncate(start + *read.as_ref().unwrap_or(&0));
+        let read = going.reading.read(&mut going.buf[start..]);
+        let n = read.as_ref().ok().copied().flatten().unwrap_or(0);
+        going.buf.truncate(start + n);
         let r = &self.r;
-        let ended = match read {
-            Ok(0) => true,
-            Ok(_) => {
-                going.reading.last_read = Instant::now();
-                let whole = pulse::whole_frames(going.buf.len());
-                self.processing.going(&going.buf[..whole], || r.cancelled());
-                going.buf.drain(..whole);
-                false
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => false,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if going.reading.last_read.elapsed() >= output_timeout(going.reading.http) {
-                    true
-                } else {
-                    let until = Instant::now() + Duration::from_millis(20);
-                    process::ready_one(&going.reading.pipe, libc::POLLIN, Some(until)).is_err()
-                }
-            }
-            Err(_) => true,
-        };
-        if ended {
+        if n > 0 {
+            self.processing.going(&going.buf, || r.cancelled());
+            going.buf.clear();
+        }
+        if matches!(read, Ok(Some(0)) | Err(_)) {
             self.processing.going_ended(|| r.cancelled());
             self.going = None;
         }
         if self.r.cancelled() {
             return Err(Done);
-        }
-        Ok(())
-    }
-
-    /// The decoder that closed its pipe, reaped: a failure it reports, or one its log tells of,
-    /// ends the run.
-    fn settle_decoder(&mut self) -> Result<(), Done> {
-        // Collect final stderr before publishing failure; the reader drains while wait() runs, so
-        // stderr cannot fill its pipe and deadlock child exit.
-        let r = &self.r;
-        let status = self.reading.decoder.child.wait(|| r.cancelled());
-        // A -t span may close ffmpeg before plugin EOF. Reclaim that feeder before draining
-        // PulseAudio, which might never return.
-        let (feed_error, log) = self.reading.decoder.finish();
-        if self.r.cancelled() {
-            return Err(Done);
-        }
-        if let Some(error) = feed_error {
-            return Err(self.fail(error));
-        }
-        let failure = match status {
-            Ok(status) if status.success() => None,
-            Ok(status) => Some(format!("ffmpeg: {status}")),
-            Err(e) => Some(format!("ffmpeg: {e}")),
-        };
-        // ffmpeg can return success after an interrupted HTTP read or a decode error. Do not let
-        // explicit invalid-media/auth diagnostics become an EOF that the engine might mistake
-        // for a retryable truncated network stream.
-        if failure.is_some()
-            || (self.reading.http && transport_log(&log))
-            || non_transport_log(&log.to_ascii_lowercase())
-        {
-            return Err(self.fail(decoder_error(
-                log,
-                self.reading.http,
-                false,
-                failure.unwrap_or_else(|| "ffmpeg decoding stopped".into()),
-            )));
         }
         Ok(())
     }
@@ -1204,7 +945,7 @@ impl Writer {
             DECLICK
         };
         self.r.stop.store(true, Ordering::Release);
-        // Reap decoders, stderr readers and feeders before any potentially blocking PulseAudio
+        // Release decoders and their sources before any potentially blocking PulseAudio
         // cleanup.
         let Self {
             ahead,
@@ -1260,20 +1001,29 @@ fn open_sink(
     (stream.map(Sink::Pulse), version)
 }
 
-/// How long the writer waits on a silent decoder. Let ffmpeg's five-second -rw_timeout report its
-/// real transport diagnostic first: this is only a decoder-output guard, not proof of a network
-/// failure.
-fn output_timeout(http: bool) -> Duration {
-    process::IO_TIMEOUT
-        + if http {
-            Duration::from_secs(1)
-        } else {
-            Duration::ZERO
+#[cfg(feature = "test-support")]
+pub fn decode_pcm(
+    path: &std::path::Path,
+    from: Duration,
+    rate: NonZeroU32,
+) -> Result<Vec<u8>, AudioError> {
+    let factory = crate::PathAudioSourceFactory::new(path);
+    let mut reading = Reading::start(
+        |_| {},
+        &factory,
+        (from, None, AudioTrackSelection::Default),
+        rate,
+    )?;
+    let mut out = Vec::new();
+    let mut buf = [0; 8192];
+    loop {
+        match reading.read(&mut buf)? {
+            Some(0) => return Ok(out),
+            Some(n) => out.extend_from_slice(&buf[..n]),
+            None => {}
         }
+    }
 }
-
-/// How long a writer waiting on its decoder goes without looking for the song wanted next.
-const NEXT_LOOK: Duration = Duration::from_millis(100);
 
 #[cfg(test)]
 mod tests;

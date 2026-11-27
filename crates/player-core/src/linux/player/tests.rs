@@ -31,7 +31,7 @@ fn pulse_playback_follows_heard_audio() {
         .success();
     assert!(ok);
     let f: Arc<dyn AudioSourceFactory> = Arc::new(PathAudioSourceFactory::new(&wav));
-    let mut p = AudioPlayer::open(f, TrackHint, Arc::new(|| {}), None).unwrap();
+    let mut p = AudioPlayer::open(f, AudioTrackSelection::Default, Arc::new(|| {}), None).unwrap();
     assert!(!p.silent);
     let d = p.duration.expect("duration");
     assert!((d.as_secs_f64() - 3.0).abs() < 0.05, "{d:?}");
@@ -109,7 +109,7 @@ fn pulse_playback_follows_heard_audio() {
     let factory = Arc::new(PathAudioSourceFactory::new(&wav));
     let mut player = AudioPlayer::open(
         factory,
-        TrackHint,
+        AudioTrackSelection::Default,
         Arc::new(|| {}),
         Some(Duration::from_secs(3)),
     )
@@ -133,7 +133,7 @@ fn pulse_playback_follows_heard_audio() {
     let factory = Arc::new(PathAudioSourceFactory::new(&wav));
     let mut player = AudioPlayer::open(
         factory,
-        TrackHint,
+        AudioTrackSelection::Default,
         Arc::new(|| {}),
         Some(Duration::from_secs(60)),
     )

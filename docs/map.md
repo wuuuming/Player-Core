@@ -15,7 +15,7 @@ host (NovaPlayer)                       one AudioPlayer per song; wake callback 
      │   media loop (host thread) ── AudioOutput ── orders ──▶ owner thread ── binding
      │                                    ◀── edges ──          ├─ decode worker: pump → DSP chain → ring
      │                                                          └─ device callback: ring → volume → device
-     └─ Linux    src/linux/             ffmpeg CLI child → pipe → writer thread (DSP chain, volume) → PulseAudio
+     └─ Linux    src/linux/             in-process FFmpeg (C shim) → writer thread (DSP chain, volume) → PulseAudio
 shared       dsp.rs, replay_gain.rs, media_tags.rs, tag_rule.rs, timing.rs, clap/ (CLAP effects), crates/media-io (sources)
 native       src/native/*.c (Windows only): decoder, demux thread, URL source, tags, TAK, upmix, ASIO
 ```
@@ -24,8 +24,8 @@ Threads, Windows: the host's media loop (calls `AudioPlayer`); `player-core-audi
 binding, the device stream and every rebind); `player-core-audio-decode` (one per binding: decodes,
 runs the chain, fills the ring; MMCSS "Audio"); `player-core-audio-next` (opens the next song);
 the device callback (MMCSS "Pro Audio"); one demux thread per decoder (C); the endpoint watcher;
-`clap-host`. Linux: the host; `pulse-out` (one per run: drives the ffmpeg child, runs the chain,
-writes Pulse at the sink's rate); `audio-next` (probes the next song); the feeder and stderr threads of each child;
+`clap-host`. Linux: the host; `pulse-out` (one per run: reads PCM from its decoder, runs the chain,
+writes Pulse at the sink's rate); `audio-next` (probes the next song); each open decoder's demux thread;
 `clap-host`.
 
 ## 2. Flows
@@ -56,11 +56,10 @@ song's known end for a crossfade (the old pump then refills `StreamWriter`'s goi
 overlap is over), keeps the old one 2 s for a seek back → `AudioEdge::Followed` (the overlap's
 start) → `take_up_boundaries` when the clock reaches it → `followed()`.
 
-**Linux.** `start()` spawns `pulse-out` running `write_run`: ffmpeg child (`-ss`/`-t` for the
-span) → `Processing::block` (chain, volume) → Pulse stream. Play/pause/seek halt the run and start
-another at the position. Gapless: the next song's child starts ahead (`Ahead`) and is spliced in
+**Linux.** `start()` spawns `pulse-out` running `write_run`: in-process decoder over the requested span → `Processing::block` (chain, volume) → Pulse stream. Play/pause/seek halt the run and start
+another at the position. Gapless: the next song's decoder opens ahead (`Ahead`) and is spliced in
 at EOF (`Run::cross`), heard when Pulse's latency says so (`take_up`). Crossfade: the read stops at
-the handover (`Writer::read_end`), the going child becomes `Going` and is read alongside
+the handover (`Writer::read_end`), the going decoder becomes `Going` and is read alongside
 (`read_going`), `Processing` sums the two.
 
 ## 3. Modules
@@ -117,21 +116,13 @@ the handover (`Writer::read_end`), the going child becomes `Going` and is read a
 | Module | Owns |
 |---|---|
 | `player.rs` | `AudioPlayer`, `Run`, `Following`, `AudioNext`, `AudioOpenOptions` |
-| `playback.rs` | `write_run` and its `Writer` (look ahead, route moves, read, wait, handover, song end), ffmpeg child, `Processing` (chains, crossfade sum, volume), `Ahead` (next song), `Going` (crossfade), errors from stderr |
+| `playback.rs` | `write_run` and its `Writer` (look ahead, route moves, read, wait, handover, song end), native decoder, `Processing` (chains, crossfade sum, volume), `Ahead` (next song), `Going` (crossfade) |
 | `pulse/` | libpulse by `dlopen`: `Stream` (open, write, latency, drain, flush, fade-out); `Recent`, the sound last written, kept for a fade-out |
 | `output.rs` | output selection through libpulse sink introspection; null and capture outputs (tests) |
-| `probe.rs` | tags and duration (lofty, else ffprobe JSON), ReplayGain tags for playback |
-| `process.rs` | child ownership, bounded waits, stderr tail, `capture` |
-| `source.rs`, `types.rs` | `UrlAudioSourceFactory` (the address to ffmpeg), the input's ffmpeg form; `AudioError`, `TrackHint` |
+| `probe.rs` | tags and duration (lofty for lightweight local reads, else native AVIO), ReplayGain tags for playback |
+| `source.rs`, `types.rs` | HTTP path recognition; `AudioError` |
 
-Linux runs the system's `ffmpeg` and `ffprobe` and loads `libpulse.so.0` at run time.
-One `media-io` `AudioSourceFactory` serves both platforms: Windows reads its bytes (`open`),
-Linux hands ffmpeg its `input` (a path, an address with its headers and agent, or host PCM fed on
-stdin). `PathAudioSourceFactory`, `UrlAudioSourceFactory` and `PcmAudioSourceFactory` exist on
-both; a byte-only factory (SFTP) plays on Windows only. `AudioPlayer` and `AudioOpenOptions` are
-the same on both hosts, method for method (`src/api_parity.rs` reads the two sources and fails on
-any difference not listed there). Linux plays FFmpeg's default stream (`TrackHint` where Windows
-takes an `AudioTrackSelection`) and reports a failed open as an `AudioError`; it has no playback
+Both platforms link the vendored FFmpeg and decode the selected `AudioTrackSelection` from the factory's bytes. Linux uses system GnuTLS for HTTPS and libpulse at run time. Linux reports a failed open as an `AudioError`; it has no playback
 rate, stream description, callback metrics or WASAPI timing policy. Real output tests need
 `NOVA_PULSE_TEST=1` and a disposable null sink (`PULSE_SINK`), never the user's default device.
 
@@ -147,7 +138,7 @@ role puts it: a song's thing in a song's scope, the listener's in the stream's (
 | DSP chains | `dsp.rs` `DspStage`/`DspChain` | the song's: a song; the stream's: a binding (Win) or a run (Linux) · decode worker (Win), `pulse-out` (Linux) | ReplayGain and peak limiting (song); CLAP effects across boundaries (stream); latency compensation; tails at a song's and the sound's end | a stage |
 | Peak limiter | `dsp.rs` `PeakLimiter` | its stage · its stage's thread | full scale after ReplayGain; −1 dBFS with 1.5 ms look-ahead after mixing to speakers | a ceiling, a look-ahead |
 | Song sequence | Windows `worker.rs` + `follow.rs`; Linux `playback.rs` `Ahead` + `Run::cross` | the stream · decode worker / `pulse-out`; next song opened on its own thread | gapless or crossfaded next song, seek back over a boundary, CUE spans | an `AudioNext` |
-| Song end | `pump.rs` `SongEnd`, `session.rs` `StopBound`; Linux ffmpeg `-t` | a song · decode worker | the file's end, a CUE track's end; whether the sound ends there or a song follows | a position |
+| Song end | `pump.rs` `SongEnd`, `session.rs` `StopBound`; Linux `Reading::limit` | a song · decode worker | the file's end, a CUE track's end; whether the sound ends there or a song follows | a position |
 | Generation | `clock.rs` `GenerationCounter` | the player · written by the media loop | seek, rebind, cancelled attempts, late answers discarded | a number |
 | Orders / edges | `session.rs` `AudioOrder`, `AudioEdge` | the player · media loop ↔ owner thread | every media-loop → owner request, every owner → media-loop event | an enum case |
 | Host wake | `metrics.rs` `SharedMetrics::flag`, `Announce`; `next_wake_at` | the player · any thread → host | end of song, buffering, input ended, boundary heard, device faults | a flag / a deadline |
@@ -180,7 +171,7 @@ are maintained separately, named here by file.
 | Multichannel mixing | `mix.rs`, `bn_upmix.c` | `audio/multichannel_tests.rs` | |
 | Network sources, recovery | `source/`, `bn_http.c`, `bn_demux.c` | | `audio_source_contract.rs`, `audio_supply.rs`, `netsim.rs`, `loopback_http_server.rs` |
 | Supply (no starved output) | `callback.rs`, `metrics.rs` | | `audio_supply.rs` |
-| Tags, cover, lyrics | `tag_rule.rs` (names per field, lyrics, lossless codecs, depth: both platforms); readers `tags.rs` + `bn_tags.c`, `linux/probe.rs` (ffprobe, lofty) | `media_tags/tests.rs` | `media_tags.rs`, `legacy_tags.rs`, `linux_decode.rs` |
+| Tags, cover, lyrics | `tag_rule.rs` (names per field, lyrics, lossless codecs, depth: both platforms); readers `tags.rs` + `bn_tags.c`, `linux/probe.rs` (native probe and lofty) | `media_tags/tests.rs` | `media_tags.rs`, `legacy_tags.rs`, `linux_decode.rs` |
 | Legacy text | `legacy_text.rs` (both) | `legacy_text/tests.rs` | |
 | Output selection, fallback | `device.rs`, `endpoints.rs`; `linux/output.rs` | `audio/tests.rs` | |
 | Linux writer | `linux/playback.rs` | `support/linux_playback.rs` |

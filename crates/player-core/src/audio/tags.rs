@@ -1,17 +1,23 @@
 //! What a container says about itself: its tags, its length, whether it has a picture that
 //! moves, and the cover attached to it. A probe — it opens the container, reads, and closes it.
 
-use super::error::{AudioOpenError, NativeError};
-use super::ffi::{
-    bn_audio_decoder_tag, bn_media_tags_free, bn_media_tags_probe_source, BnMediaTags,
-    NativeAudioDecoder,
-};
+#[cfg(windows)]
+use super::error::AudioOpenError;
+use super::ffi::{bn_media_tags_free, bn_media_tags_probe_source, BnMediaTags};
+#[cfg(target_os = "linux")]
+use super::types::AudioError as AudioOpenError;
+use crate::source::NativeError;
 use crate::source::{NativeMediaByteSource, NativeMessage};
 use crate::tag_rule::Said;
 use crate::ReplayGainTags;
 use crate::{AudioResolution, MediaTags};
-use std::ffi::{c_char, CString};
+use std::ffi::c_char;
 use std::time::Duration;
+#[cfg(windows)]
+use {
+    super::ffi::{bn_audio_decoder_tag, NativeAudioDecoder},
+    std::ffi::CString,
+};
 
 /// A fixed native name (codec, container): ASCII, NUL-terminated.
 fn name_text(bytes: &[c_char]) -> Option<String> {
@@ -42,6 +48,12 @@ fn said(blob: &[u8]) -> Said {
 pub fn probe_media_tags(
     source: Box<dyn crate::MediaByteSource>,
 ) -> Result<MediaTags, AudioOpenError> {
+    probe(source).map(|(tags, _)| tags).map_err(Into::into)
+}
+
+pub(super) fn probe(
+    source: Box<dyn crate::MediaByteSource>,
+) -> Result<(MediaTags, ReplayGainTags), NativeError> {
     // The size is the transport's to know, before the container is opened over it.
     let file_size = source.size();
     let mut source = NativeMediaByteSource::new(source);
@@ -59,12 +71,12 @@ pub fn probe_media_tags(
         )
     };
     if status != 0 {
-        return Err(AudioOpenError::Native(NativeError {
+        return Err(NativeError {
             operation: "tag reading",
             status,
             transport: 0,
             message: error.message(),
-        }));
+        });
     }
     let cover = (!native.picture.is_null() && native.picture_size > 0).then(|| {
         // SAFETY: the shim's picture, `picture_size` bytes, alive until `bn_media_tags_free`.
@@ -82,30 +94,35 @@ pub fn probe_media_tags(
     // SAFETY: the tags the probe filled, freed once; nothing borrowed from them is kept (copied above).
     unsafe { bn_media_tags_free(&mut native) };
     let codec = name_text(&native.audio_codec).unwrap_or_default();
-    Ok(MediaTags {
-        duration: (native.has_duration != 0)
-            .then(|| Duration::from_micros(u64::try_from(native.duration_us).unwrap_or(0))),
-        has_audio: native.has_audio != 0,
-        has_video: native.has_video != 0,
-        cover,
-        resolution: (native.has_audio != 0)
-            .then(|| {
-                AudioResolution::of(
-                    codec,
-                    u32::try_from(native.audio_sample_rate).unwrap_or(0),
-                    (native.audio_bits_raw.into(), native.audio_bits_coded.into()),
-                    u32::try_from(native.audio_bit_rate).ok(),
-                )
-            })
-            .flatten(),
-        container: name_text(&native.container),
-        file_size,
-        ..words
-    })
+    let gain = ReplayGainTags::read(|key| said.get(key));
+    Ok((
+        MediaTags {
+            duration: (native.has_duration != 0)
+                .then(|| Duration::from_micros(u64::try_from(native.duration_us).unwrap_or(0))),
+            has_audio: native.has_audio != 0,
+            has_video: native.has_video != 0,
+            cover,
+            resolution: (native.has_audio != 0)
+                .then(|| {
+                    AudioResolution::of(
+                        codec,
+                        u32::try_from(native.audio_sample_rate).unwrap_or(0),
+                        (native.audio_bits_raw.into(), native.audio_bits_coded.into()),
+                        u32::try_from(native.audio_bit_rate).ok(),
+                    )
+                })
+                .flatten(),
+            container: name_text(&native.container),
+            file_size,
+            ..words
+        },
+        gain,
+    ))
 }
 
 /// The song's ReplayGain values, from the tags of the file `decoder` decodes. Read on the opening
 /// thread, before the decoder moves to its worker.
+#[cfg(windows)]
 pub fn replay_gain_tags(decoder: &NativeAudioDecoder) -> ReplayGainTags {
     ReplayGainTags::read(|name| {
         let name = CString::new(name).ok()?;

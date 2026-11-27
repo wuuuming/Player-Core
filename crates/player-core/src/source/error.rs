@@ -5,6 +5,36 @@ use crate::AudioSourceError;
 use std::ffi::{c_char, CStr};
 use std::mem::MaybeUninit;
 
+/// A failure the native shim reported: the call's status, the transport error under it and the
+/// shim's message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeError {
+    /// What was being done: "open", "seek", "decode", "DSD open", "track listing", "tag reading".
+    pub operation: &'static str,
+    /// The shim's nonzero status; 0 when no shim call failed (it returned no decoder, say).
+    pub status: i32,
+    /// The transport AVERROR under the failure; 0 when there was none or it is unknown.
+    pub transport: i32,
+    pub message: String,
+}
+
+impl NativeError {
+    /// True only when the transport under the failure is a transient network failure.
+    pub fn is_network_failure(&self) -> bool {
+        self.transport != 0 && crate::source::native_is_network_failure(self.transport)
+    }
+}
+
+impl std::fmt::Display for NativeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "native audio {} failed with status {}: {}",
+            self.operation, self.status, self.message
+        )
+    }
+}
+
 pub(crate) fn native_is_network_failure(code: i32) -> bool {
     // SAFETY: a plain value; the shim only compares it.
     unsafe { bn_error_is_network_failure(code) != 0 }
