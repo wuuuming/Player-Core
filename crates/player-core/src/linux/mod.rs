@@ -24,9 +24,7 @@ pub use player::{AudioNext, AudioOpenOptions, AudioPlayer};
 // What the separately maintained tests reach (`crate::internals`): not API, so not in `linux::*`.
 #[cfg(feature = "test-support")]
 pub(crate) mod test_internals {
-    pub use super::playback::{
-        decoder_command, Processing, CHAIN_CHANNELS, CHAIN_RATE, FRAME_BYTES,
-    };
+    pub use super::playback::{decoder_command, Processing, CHAIN_CHANNELS, FRAME_BYTES};
     pub use super::probe::for_playback;
 }
 pub use probe::{probe_path, probe_path_cancellable, probe_stream_cancellable, probe_tags_only};

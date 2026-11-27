@@ -25,14 +25,15 @@ fn plain_bytes(samples: &[f32]) -> Vec<u8> {
 /// per-buffer scale stepped by 0.4 here), and held, it settles on the factor it was given.
 #[test]
 fn a_volume_sweep_glides_without_zipper_steps() {
+    let rate = NonZeroU32::new(48_000).unwrap();
     let dsp = Arc::new(Mutex::new(song_chain(
         Arc::new(ReplayGainSetting::default()),
         ReplayGainTags::default(),
-        CHAIN_RATE,
+        rate,
         CHAIN_CHANNELS,
     )));
     let volume = full_volume();
-    let mut processing = Processing::new(dsp, None, volume.clone());
+    let mut processing = Processing::new(dsp, None, volume.clone(), rate);
     let block = plain_bytes(&[0.5; 2 * 64]);
     let mut rendered = Vec::new();
     for step in 0..160 {

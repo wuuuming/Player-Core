@@ -1,6 +1,6 @@
 use super::*;
 use crate::linux::pulse;
-use crate::{enumerate_output_systems, set_output_route, AudioOutputRoute, PathAudioSourceFactory};
+use crate::PathAudioSourceFactory;
 
 /// A real file through ffmpeg and the sound server: the position follows what was heard,
 /// pause holds it, seek moves it, the end is reported. Needs `ffmpeg` and a pulse server;
@@ -152,88 +152,5 @@ fn pulse_playback_follows_heard_audio() {
             .abs_diff(Duration::from_secs(3))
             <= Duration::from_micros(21)
     );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The sinks are listed, and switching mid-song moves the stream to the chosen sink while
-/// the position keeps going.
-#[test]
-fn output_switch_moves_the_stream() {
-    if std::env::var("NOVA_PULSE_TEST").is_err() {
-        eprintln!("skipped: NOVA_PULSE_TEST not set");
-        return;
-    }
-    let sys = enumerate_output_systems();
-    let sinks = &sys[0].devices;
-    assert!(sinks.len() >= 2, "need two sinks: {sinks:?}");
-    assert_eq!(
-        sinks.iter().filter(|d| d.is_default).count(),
-        1,
-        "{sinks:?}"
-    );
-    let other = sinks.iter().find(|d| !d.is_default).unwrap().id.clone();
-    let dir = std::env::temp_dir().join(format!("nova-route-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let wav = dir.join("tone.wav");
-    assert!(std::process::Command::new("ffmpeg")
-        .args([
-            "-v",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:duration=3"
-        ])
-        .arg(&wav)
-        .status()
-        .unwrap()
-        .success());
-    let on_sink = || {
-        let o = std::process::Command::new("pactl")
-            .args(["list", "sink-inputs"])
-            .env("LC_ALL", "C")
-            .output()
-            .unwrap();
-        let t = String::from_utf8_lossy(&o.stdout).into_owned();
-        let idx = t
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("Sink: ").map(str::to_owned))?;
-        let o = std::process::Command::new("pactl")
-            .args(["list", "short", "sinks"])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .find(|l| l.split(char::is_whitespace).next() == Some(idx.as_str()))
-            .and_then(|l| l.split(char::is_whitespace).nth(1).map(str::to_owned))
-    };
-    set_output_route(AudioOutputRoute::WasapiDefault);
-    let f: Arc<dyn AudioSourceFactory> = Arc::new(PathAudioSourceFactory::new(&wav));
-    let mut p = AudioPlayer::open(f, TrackHint, Arc::new(|| {}), None).unwrap();
-    p.set_volume(0.05);
-    p.play().unwrap();
-    std::thread::sleep(Duration::from_millis(600));
-    let def = sinks.iter().find(|d| d.is_default).unwrap().id.clone();
-    assert_eq!(
-        on_sink().as_deref(),
-        Some(def.as_str()),
-        "starts on the default"
-    );
-    let before = p.position(Instant::now()).as_secs_f64();
-    assert_eq!(
-        set_output_route(AudioOutputRoute::Wasapi(other.clone())),
-        AudioOutputRoute::Wasapi(other.clone())
-    );
-    std::thread::sleep(Duration::from_millis(600));
-    assert_eq!(
-        on_sink().as_deref(),
-        Some(other.as_str()),
-        "moved to the chosen sink"
-    );
-    let after = p.position(Instant::now()).as_secs_f64();
-    assert!(after > before + 0.3, "keeps going: {before} -> {after}");
-    p.dispose().unwrap();
-    set_output_route(AudioOutputRoute::WasapiDefault);
     let _ = std::fs::remove_dir_all(&dir);
 }

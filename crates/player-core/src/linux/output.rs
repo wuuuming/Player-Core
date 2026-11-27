@@ -1,4 +1,4 @@
-use super::{process, pulse};
+use super::pulse;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::PoisonError;
 
@@ -38,52 +38,21 @@ pub struct AudioOutputSystem {
     pub devices: Vec<AudioOutputDeviceInfo>,
 }
 
-/// The sound server's sinks (`pactl list sinks`, C locale: its field names are translated
-/// otherwise), the server's default marked. The shim keeps Windows' host names: `Wasapi` is the
-/// sound server, a device id is a sink name.
+/// The sound server's sinks, with the server's default marked. A device id is a sink name.
 pub fn enumerate_output_systems() -> Vec<AudioOutputSystem> {
     #[cfg(feature = "test-support")]
     if NULL_OUTPUT.load(Ordering::Relaxed) {
         return crate::null_output_systems();
     }
-    if !pulse::available() {
-        return vec![AudioOutputSystem {
-            host: AudioOutputHost::Wasapi,
-            devices: vec![AudioOutputDeviceInfo {
-                id: "default".into(),
-                name: "No sound server".into(),
-                is_default: true,
-                generic: false,
-                caps: None,
-            }],
-        }];
-    }
-    let pactl = |args: &[&str]| {
-        let mut cmd = std::process::Command::new("pactl");
-        cmd.args(args).env("LC_ALL", "C");
-        process::capture(&mut cmd, || false, process::IO_TIMEOUT, 2 * 1024 * 1024)
-            .ok()
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-    };
-    let default = pactl(&["get-default-sink"])
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_default();
-    let mut devices = Vec::new();
-    let mut name: Option<String> = None;
-    for line in pactl(&["list", "sinks"]).unwrap_or_default().lines() {
-        let t = line.trim();
-        if let Some(n) = t.strip_prefix("Name: ") {
-            name = Some(n.to_owned());
-        } else if let (Some(d), Some(n)) = (t.strip_prefix("Description: "), name.take()) {
-            devices.push(AudioOutputDeviceInfo {
-                is_default: n == default,
-                id: n,
-                name: d.to_owned(),
-                generic: false,
-                caps: None,
-            });
-        }
-    }
+    let devices = pulse::Stream::devices().unwrap_or_else(|_| {
+        vec![AudioOutputDeviceInfo {
+            id: "default".into(),
+            name: "No sound server".into(),
+            is_default: true,
+            generic: false,
+            caps: None,
+        }]
+    });
     vec![AudioOutputSystem {
         host: AudioOutputHost::Wasapi,
         devices,
@@ -134,7 +103,7 @@ pub fn use_null_audio_output(on: bool) {
     NULL_OUTPUT.store(on, Ordering::Relaxed);
 }
 
-/// What the output has played, interleaved stereo `f32` at 48 kHz, while a test listens; `None`
+/// What the output has played, interleaved stereo `f32` at the capture endpoint's rate, while a test listens; `None`
 /// while nobody does.
 static CAPTURE: std::sync::Mutex<Option<Vec<f32>>> = std::sync::Mutex::new(None);
 
@@ -166,10 +135,31 @@ pub(super) struct Capture {
 impl Capture {
     const HELD_US: u64 = 100_000;
 
+    pub(super) fn rate(&self) -> std::num::NonZeroU32 {
+        self.written.rate
+    }
+
     pub(super) fn new() -> Self {
+        // The capture represents the selected null endpoint, or its default.
+        #[cfg(feature = "test-support")]
+        let route = output_route();
+        #[cfg(feature = "test-support")]
+        let rate = crate::null_output_systems()
+            .into_iter()
+            .flat_map(|s| s.devices)
+            .find(|d| match &route {
+                AudioOutputRoute::Wasapi(id) => &d.id == id,
+                _ => d.is_default,
+            })
+            .and_then(|d| d.caps?.rates.first().copied())
+            .unwrap_or(48_000);
+        #[cfg(not(feature = "test-support"))]
+        let rate = 48_000;
         Self {
             started: std::time::Instant::now(),
-            written: pulse::Recent::new(),
+            written: pulse::Recent::new(
+                std::num::NonZeroU32::new(rate).unwrap_or(std::num::NonZeroU32::MIN),
+            ),
         }
     }
 
@@ -190,7 +180,7 @@ impl Capture {
 
     pub(super) fn latency_us(&self) -> u64 {
         let played = self.started.elapsed().as_micros() as u64;
-        pulse::bytes_to_micros(self.written.written()).saturating_sub(played)
+        pulse::bytes_to_micros(self.written.written(), self.rate().get()).saturating_sub(played)
     }
 
     pub(super) fn drain(&self) {
@@ -200,7 +190,7 @@ impl Capture {
     /// `pulse::Stream::fade_out`: what it holds from what plays now on is captured again faded,
     /// and played to its end.
     pub(super) fn fade_out(&mut self, fade: std::time::Duration) -> bool {
-        let from = pulse::duration_to_bytes(self.started.elapsed());
+        let from = pulse::duration_to_bytes(self.started.elapsed(), self.rate().get());
         let Some(faded) = self.written.faded_from(from, fade) else {
             return false;
         };

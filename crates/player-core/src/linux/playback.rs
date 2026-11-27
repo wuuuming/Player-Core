@@ -5,7 +5,9 @@ use super::player::{Following, Run, Terminal};
 use super::source::{ffmpeg_input, is_network};
 use super::types::{AudioError, AudioErrorKind};
 use super::{process, pulse};
-use crate::dsp::{handover_at, Crossfade, DspChain, UserGain};
+use crate::dsp::{
+    handover_at, song_chain, stream_chain, Crossfade, DspChain, ReplayGainSetting, UserGain,
+};
 use crate::dsp::{one_pole, one_pole_coefficient, USER_GAIN_SMOOTHING};
 use crate::{AudioInput, PcmSource};
 use std::io::{Read, Write};
@@ -178,11 +180,7 @@ pub(super) fn decoder_error(
     )
 }
 
-/// The stream's rate and channels, as the chain takes them.
-pub const CHAIN_RATE: NonZeroU32 = match NonZeroU32::new(pulse::RATE) {
-    Some(rate) => rate,
-    None => panic!("the stream has a rate"),
-};
+/// The stereo channels every stream uses.
 pub const CHAIN_CHANNELS: NonZeroUsize = match NonZeroUsize::new(pulse::CHANNELS as usize) {
     Some(channels) => channels,
     None => panic!("the stream has channels"),
@@ -309,13 +307,14 @@ impl Processing {
         song: Arc<Mutex<DspChain>>,
         stream: Option<DspChain>,
         volume: Arc<UserGain>,
+        rate: NonZeroU32,
     ) -> Self {
         Self {
             song: RunChain::new(song),
             stream: stream.map(RunChain::new),
             volume,
             level: None,
-            smoothing: one_pole_coefficient(USER_GAIN_SMOOTHING, CHAIN_RATE),
+            smoothing: one_pole_coefficient(USER_GAIN_SMOOTHING, rate),
             samples: Vec::new(),
             bytes: Vec::new(),
             fade: None,
@@ -480,7 +479,7 @@ fn sample_output(run: &Run, out: &mut Sink, written: u64) -> Result<u64, AudioEr
     }
     let latency = out.latency_us()?;
     if !run.cancelled() {
-        let heard = pulse::bytes_to_micros(written).saturating_sub(latency);
+        let heard = pulse::bytes_to_micros(written, out.rate().get()).saturating_sub(latency);
         if heard > run.heard_us.fetch_max(heard, Ordering::Relaxed) {
             run.last_progress_us
                 .store(run.started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -516,11 +515,12 @@ fn drain_output(run: &Run, out: &mut Sink, written: u64) -> Result<(), AudioErro
 }
 
 /// The decoder: `ffmpeg` reading `input` (the host's PCM on its stdin) from `from` for at most
-/// `limit`, writing 48 kHz stereo `f32le` to its stdout. An address's requests carry its headers
+/// `limit`, writing sink-rate stereo `f32le` to its stdout. An address's requests carry its headers
 /// and agent.
 pub fn decoder_command(
     input: &AudioInput,
     (from, limit): (Duration, Option<Duration>),
+    rate: NonZeroU32,
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new("ffmpeg");
     // Decode errors must not be silently accepted as successful (possibly premature) EOF.
@@ -571,7 +571,7 @@ pub fn decoder_command(
         "-ac",
         &pulse::CHANNELS.to_string(),
         "-ar",
-        &pulse::RATE.to_string(),
+        &rate.to_string(),
         "-f",
         "f32le",
         "-",
@@ -593,6 +593,13 @@ pub(super) enum Sink {
 }
 
 impl Sink {
+    fn rate(&self) -> NonZeroU32 {
+        match self {
+            Self::Pulse(s) => s.rate(),
+            Self::Capture(c) => c.rate(),
+        }
+    }
+
     fn write(&mut self, bytes: &[u8]) -> Result<(), AudioError> {
         match self {
             Self::Pulse(stream) => stream.write(bytes),
@@ -642,9 +649,10 @@ fn start_decoder(
     r: &Arc<Run>,
     input: &AudioInput,
     span: (Duration, Option<Duration>),
+    rate: NonZeroU32,
 ) -> Result<Option<(Decoder, std::process::ChildStdout)>, AudioError> {
     let decoder_io = |e| AudioError::new(AudioErrorKind::Decoder, format!("ffmpeg: {e}"));
-    let mut cmd = decoder_command(input, span);
+    let mut cmd = decoder_command(input, span, rate);
     let pcm: Option<Arc<dyn PcmSource>> = match input {
         AudioInput::Pcm(s) => Some(s.clone()),
         _ => None,
@@ -716,19 +724,22 @@ impl Reading {
         r: &Arc<Run>,
         input: &AudioInput,
         span: (Duration, Option<Duration>),
+        rate: NonZeroU32,
     ) -> Result<Option<Self>, AudioError> {
-        Ok(start_decoder(r, input, span)?.map(|(decoder, pipe)| Self {
-            decoder,
-            pipe,
-            http: is_network(input),
-            length: span.1,
-            read: 0,
-            last_read: Instant::now(),
-        }))
+        Ok(
+            start_decoder(r, input, span, rate)?.map(|(decoder, pipe)| Self {
+                decoder,
+                pipe,
+                http: is_network(input),
+                length: span.1,
+                read: 0,
+                last_read: Instant::now(),
+            }),
+        )
     }
 }
 
-/// `ffmpeg` decodes to 48 kHz stereo `f32le`; `processing` takes it to the stream. This worker
+/// `ffmpeg` decodes to sink-rate stereo `f32le`; `processing` takes it to the stream. This worker
 /// owns the cancellable PulseAudio event loop; controllers cancel children/feeds but never wait
 /// for output cleanup.
 ///
@@ -738,9 +749,12 @@ pub(super) fn write_run(
     r: Arc<Run>,
     input: &AudioInput,
     span: (Duration, Option<Duration>),
-    processing: Processing,
+    tags: crate::ReplayGainTags,
+    gain: Arc<ReplayGainSetting>,
+    effects: Option<crate::clap::Effects>,
+    volume: Arc<UserGain>,
 ) {
-    if let Some(mut writer) = Writer::start(r, input, span, processing) {
+    if let Some(mut writer) = Writer::start(r, input, span, tags, gain, effects, volume) {
         while writer.pass().is_ok() {}
         writer.close();
     }
@@ -753,10 +767,7 @@ struct Done;
 /// writes.
 struct Writer {
     r: Arc<Run>,
-    /// What the stream is named for the sound server.
-    what: String,
-    /// The run's cancellation, for a stream being opened to give up on.
-    cancel: Arc<dyn Fn() -> bool + Send + Sync>,
+    gain: Arc<ReplayGainSetting>,
     out: Sink,
     /// The output route `out` was opened on.
     route_version: u32,
@@ -785,7 +796,10 @@ impl Writer {
         r: Arc<Run>,
         input: &AudioInput,
         span: (Duration, Option<Duration>),
-        processing: Processing,
+        tags: crate::ReplayGainTags,
+        gain: Arc<ReplayGainSetting>,
+        effects: Option<crate::clap::Effects>,
+        volume: Arc<UserGain>,
     ) -> Option<Self> {
         if r.cancelled() {
             return None;
@@ -806,7 +820,11 @@ impl Writer {
                 return None;
             }
         };
-        let reading = match Reading::start(&r, input, span) {
+        let rate = out.rate();
+        let song = song_chain(gain.clone(), tags, rate, CHAIN_CHANNELS);
+        let stream = stream_chain(effects.as_ref(), rate, CHAIN_CHANNELS);
+        let processing = Processing::new(Arc::new(Mutex::new(song)), stream, volume, rate);
+        let reading = match Reading::start(&r, input, span, rate) {
             Ok(Some(started)) => started,
             Ok(None) => return None,
             Err(error) => {
@@ -816,8 +834,7 @@ impl Writer {
         };
         Some(Self {
             r,
-            what,
-            cancel,
+            gain,
             out,
             route_version,
             reading,
@@ -827,7 +844,7 @@ impl Writer {
             refused: 0,
             processing,
             written: 0,
-            buf: vec![0; pulse::RATE as usize / 50 * FRAME_BYTES],
+            buf: vec![0; rate.get() as usize / 50 * FRAME_BYTES],
             fill: 0,
         })
     }
@@ -878,7 +895,7 @@ impl Writer {
         let Some(song) = wanted else {
             return Ok(());
         };
-        match Reading::start(&self.r, &song.input, song.span()) {
+        match Reading::start(&self.r, &song.input, song.span(), self.out.rate()) {
             Ok(Some(reading)) => self.ahead = Some(Ahead { song, reading }),
             Ok(None) => return Err(Done),
             // Not followed: this song ends as it would have.
@@ -887,31 +904,15 @@ impl Writer {
         Ok(())
     }
 
-    /// The output route changed: the stream reopened on it, what the old one still held counted
-    /// as never written.
+    /// A new route needs a new decoder and chains at its sink's rate. The controller
+    /// starts the run again from the heard position.
     fn follow_route(&mut self) -> Result<(), Done> {
         if ROUTE_VERSION.load(Ordering::SeqCst) == self.route_version {
             return Ok(());
         }
-        let lost = self.out.latency_us().map_err(|e| self.fail(e))?;
-        if self.r.cancelled() {
-            return Err(Done);
-        }
-        self.out.flush().map_err(|e| self.fail(e))?;
-        if self.r.cancelled() {
-            return Err(Done);
-        }
-        let (next, version) = open_sink(&self.r, &self.what, &self.cancel);
-        self.route_version = version;
-        if self.r.cancelled() {
-            return Err(Done);
-        }
-        self.out = next.map_err(|e| self.fail(e))?;
-        let bytes_per_us = f64::from(pulse::RATE * pulse::FRAME_BYTES) / 1e6;
-        self.written = self
-            .written
-            .saturating_sub((lost as f64 * bytes_per_us) as u64 & !(pulse::FRAME_BYTES as u64 - 1));
-        Ok(())
+        sample_output(&self.r, &mut self.out, self.written).map_err(|e| self.fail(e))?;
+        self.r.finish(Terminal::Reroute);
+        Err(Done)
     }
 
     /// `n` more bytes from the decoder: a full buffer goes through the processing to the stream.
@@ -992,9 +993,10 @@ impl Writer {
         }
         drain_output(&self.r, &mut self.out, self.written).map_err(|e| self.fail(e))?;
         if !self.r.cancelled() {
-            self.r
-                .heard_us
-                .store(pulse::bytes_to_micros(self.written), Ordering::Relaxed);
+            self.r.heard_us.store(
+                pulse::bytes_to_micros(self.written, self.out.rate().get()),
+                Ordering::Relaxed,
+            );
             self.r.finish(Terminal::Eof);
         }
         Err(Done)
@@ -1007,7 +1009,7 @@ impl Writer {
             .ahead
             .as_ref()
             .and_then(|next| handover_at(self.reading.length, next.song.crossfade))
-            .map(pulse::duration_to_bytes);
+            .map(|d| pulse::duration_to_bytes(d, self.out.rate().get()));
         match handover {
             Some(at) => {
                 let before =
@@ -1034,7 +1036,7 @@ impl Writer {
         let left = self
             .reading
             .length
-            .map_or(0, pulse::duration_to_bytes)
+            .map_or(0, |d| pulse::duration_to_bytes(d, self.out.rate().get()))
             .saturating_sub(self.reading.read);
         let overlap = usize::try_from(left).unwrap_or(usize::MAX) / FRAME_BYTES;
         let going = self.go_on_into(next, overlap)?;
@@ -1048,7 +1050,13 @@ impl Writer {
     /// from now, and the player is told where it is heard (the overlap's start).
     /// The going song's decoder, given back.
     fn go_on_into(&mut self, next: Ahead, overlap: usize) -> Result<Going, Done> {
-        let bytes = self.processing.follow(next.song.dsp.clone(), overlap);
+        let chain = song_chain(
+            self.gain.clone(),
+            next.song.tags,
+            self.out.rate(),
+            CHAIN_CHANNELS,
+        );
+        let bytes = self.processing.follow(Arc::new(Mutex::new(chain)), overlap);
         if !bytes.is_empty() {
             if let Err(e) = write_counted(&mut self.out, &mut self.written, bytes) {
                 self.r.fail(e);
@@ -1056,8 +1064,10 @@ impl Writer {
             }
         }
         let given = self.written + (self.processing.held_frames() * FRAME_BYTES) as u64;
-        self.r
-            .cross(next.song.clone(), pulse::bytes_to_micros(given));
+        self.r.cross(
+            next.song.clone(),
+            pulse::bytes_to_micros(given, self.out.rate().get()),
+        );
         self.followed = next.song.serial;
         self.fill = 0;
         let mut gone = std::mem::replace(&mut self.reading, next.reading);

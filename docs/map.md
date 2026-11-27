@@ -25,7 +25,7 @@ binding, the device stream and every rebind); `player-core-audio-decode` (one pe
 runs the chain, fills the ring; MMCSS "Audio"); `player-core-audio-next` (opens the next song);
 the device callback (MMCSS "Pro Audio"); one demux thread per decoder (C); the endpoint watcher;
 `clap-host`. Linux: the host; `pulse-out` (one per run: drives the ffmpeg child, runs the chain,
-writes Pulse); `audio-next` (probes the next song); the feeder and stderr threads of each child;
+writes Pulse at the sink's rate); `audio-next` (probes the next song); the feeder and stderr threads of each child;
 `clap-host`.
 
 ## 2. Flows
@@ -119,12 +119,12 @@ the handover (`Writer::read_end`), the going child becomes `Going` and is read a
 | `player.rs` | `AudioPlayer`, `Run`, `Following`, `AudioNext`, `AudioOpenOptions` |
 | `playback.rs` | `write_run` and its `Writer` (look ahead, route moves, read, wait, handover, song end), ffmpeg child, `Processing` (chains, crossfade sum, volume), `Ahead` (next song), `Going` (crossfade), errors from stderr |
 | `pulse/` | libpulse by `dlopen`: `Stream` (open, write, latency, drain, flush, fade-out); `Recent`, the sound last written, kept for a fade-out |
-| `output.rs` | output selection through `pactl`; null and capture outputs (tests) |
+| `output.rs` | output selection through libpulse sink introspection; null and capture outputs (tests) |
 | `probe.rs` | tags and duration (lofty, else ffprobe JSON), ReplayGain tags for playback |
 | `process.rs` | child ownership, bounded waits, stderr tail, `capture` |
 | `source.rs`, `types.rs` | `UrlAudioSourceFactory` (the address to ffmpeg), the input's ffmpeg form; `AudioError`, `TrackHint` |
 
-Linux runs the system's `ffmpeg`, `ffprobe` and `pactl` and loads `libpulse.so.0` at run time.
+Linux runs the system's `ffmpeg` and `ffprobe` and loads `libpulse.so.0` at run time.
 One `media-io` `AudioSourceFactory` serves both platforms: Windows reads its bytes (`open`),
 Linux hands ffmpeg its `input` (a path, an address with its headers and agent, or host PCM fed on
 stdin). `PathAudioSourceFactory`, `UrlAudioSourceFactory` and `PcmAudioSourceFactory` exist on

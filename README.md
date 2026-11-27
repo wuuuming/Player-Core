@@ -49,7 +49,7 @@ On Windows the build links the audio-only FFmpeg in `crates/player-core/third_pa
 (FFmpeg c6bb22dea0, LGPL, five DLLs, ~9 MB), which `tools/ffmpeg-audio/build.sh` makes from
 FFmpeg's source, and puts its DLLs next to the built binaries; set
 `NOVA_MEDIA_NATIVE_DIR=<dir>` to link `<dir>/ffmpeg-master-latest-win64-lgpl-shared/` instead
-(same ABI, avcodec-62). Linux needs `ffmpeg`, `ffprobe` and PulseAudio at run time.
+(same ABI, avcodec-62). Linux needs `ffmpeg`, `ffprobe` and libpulse at run time. It lists sinks through libpulse and decodes stereo at the selected sink's rate.
 
 ## Contributing
 

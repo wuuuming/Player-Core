@@ -1,6 +1,6 @@
 //! The sound last written to an output, kept so its end can be written again faded out.
 
-use super::{FRAME_BYTES, RATE};
+use super::FRAME_BYTES;
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -10,15 +10,14 @@ use std::time::Duration;
 pub struct Recent {
     bytes: VecDeque<u8>,
     written: u64,
+    pub rate: std::num::NonZeroU32,
 }
 
 impl Recent {
-    /// Half a second: more than an output holds ahead of what is heard.
-    const KEPT: usize = (RATE * FRAME_BYTES / 2) as usize;
-
-    pub fn new() -> Self {
+    pub fn new(rate: std::num::NonZeroU32) -> Self {
         Self {
-            bytes: VecDeque::with_capacity(Self::KEPT),
+            bytes: VecDeque::new(),
+            rate,
             written: 0,
         }
     }
@@ -26,7 +25,9 @@ impl Recent {
     pub fn push(&mut self, bytes: &[u8]) {
         self.bytes.extend(bytes);
         self.written = self.written.saturating_add(bytes.len() as u64);
-        let over = self.bytes.len().saturating_sub(Self::KEPT);
+        // Half a second: more than an output holds ahead of what is heard.
+        let kept = (self.rate.get() * FRAME_BYTES / 2) as usize;
+        let over = self.bytes.len().saturating_sub(kept);
         self.bytes.drain(..over);
     }
 
@@ -47,7 +48,7 @@ impl Recent {
         let skip = super::whole_frames(usize::try_from(from - oldest).ok()?);
         let mut out: Vec<u8> = self.bytes.range(skip..).copied().collect();
         let frames = out.len() / frame;
-        let fade = (u128::from(RATE) * fade.as_nanos()).div_ceil(1_000_000_000);
+        let fade = (u128::from(self.rate.get()) * fade.as_nanos()).div_ceil(1_000_000_000);
         let fade = usize::try_from(fade).unwrap_or(usize::MAX).min(frames);
         for (i, frame) in out.chunks_exact_mut(frame).enumerate() {
             // Linear, its first frame at full level and its last silent (as the declick's ramp).

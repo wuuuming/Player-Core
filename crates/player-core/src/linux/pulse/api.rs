@@ -12,6 +12,15 @@ pub(super) struct SampleSpec {
     pub rate: u32,
     pub channels: u8,
 }
+/// Public pa_sink_info prefix, borrowed only during the listing callback.
+#[repr(C)]
+pub(super) struct SinkInfo {
+    pub name: *const c_char,
+    pub index: u32,
+    pub description: *const c_char,
+    pub sample_spec: SampleSpec,
+}
+pub(super) type SinkCallback = unsafe extern "C" fn(Ptr, *const SinkInfo, c_int, Ptr);
 #[repr(C)]
 pub(super) struct BufferAttr {
     pub maxlength: u32,
@@ -63,6 +72,9 @@ api! {
     pa_context_new: unsafe extern "C" fn(Ptr, *const c_char) -> Ptr,
     pa_context_connect: unsafe extern "C" fn(Ptr, *const c_char, c_int, *const c_void) -> c_int,
     pa_context_get_state: unsafe extern "C" fn(*const c_void) -> c_int,
+    pa_context_get_sink_info_list: unsafe extern "C" fn(Ptr, SinkCallback, Ptr) -> Ptr,
+    pa_context_get_sink_info_by_name: unsafe extern "C" fn(Ptr, *const c_char, SinkCallback, Ptr) -> Ptr,
+    pa_stream_get_sample_spec: unsafe extern "C" fn(Ptr) -> *const SampleSpec,
     pa_context_errno: unsafe extern "C" fn(*const c_void) -> c_int,
     pa_context_disconnect: unsafe extern "C" fn(Ptr),
     pa_context_unref: unsafe extern "C" fn(Ptr),

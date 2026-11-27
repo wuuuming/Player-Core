@@ -6,7 +6,7 @@
 //! use (or null and skipped), and freed once, in `Drop`, children first; the mainloop is
 //! non-threaded, so a callback runs only inside `pa_mainloop_dispatch` on this thread.
 use super::api::{self, BufferAttr, Lib, OperationFn, Ptr, SampleSpec};
-use super::{bytes_to_micros, Recent, CHANNELS, FRAME_BYTES, RATE};
+use super::{bytes_to_micros, Recent, CHANNELS, FRAME_BYTES};
 use crate::linux::types::{AudioError, AudioErrorKind};
 use std::cell::Cell;
 use std::ffi::{c_int, CString};
@@ -21,6 +21,7 @@ const CONTEXT_FAILED: c_int = 5;
 const STREAM_READY: c_int = 2;
 const STREAM_FAILED: c_int = 3;
 const OPERATION_RUNNING: c_int = 0;
+const FIX_RATE: c_int = 0x0080;
 const ADJUST_LATENCY: c_int = 0x2000;
 const NOT_MONOTONIC: c_int = 0x0004;
 /// `PA_SAMPLE_FLOAT32LE`.
@@ -61,20 +62,35 @@ unsafe extern "C" fn success(_stream: Ptr, success: c_int, userdata: Ptr) {
     (*userdata.cast::<Cell<c_int>>()).set(success);
 }
 
+unsafe extern "C" fn sink_info(_: Ptr, info: *const api::SinkInfo, end: c_int, data: Ptr) {
+    if end != 0 {
+        return;
+    }
+    // SAFETY: libpulse supplies the borrowed sink and strings for this callback;
+    // devices() supplies the vector, with exclusive access during dispatch.
+    if let Some(sink) = info.as_ref() {
+        if let Some(id) = crate::c_text(sink.name) {
+            (*data.cast::<Vec<crate::AudioOutputDeviceInfo>>()).push(
+                crate::AudioOutputDeviceInfo {
+                    name: crate::c_text(sink.description).unwrap_or_else(|| id.clone()),
+                    id,
+                    is_default: false,
+                    generic: false,
+                    caps: Some(crate::AudioDeviceCaps {
+                        channels: sink.sample_spec.channels.into(),
+                        rates: vec![sink.sample_spec.rate],
+                        dsd: None,
+                    }),
+                },
+            );
+        }
+    }
+}
+
 impl Stream {
-    pub fn open(
-        what: &str,
-        sink: Option<&str>,
-        cancel: Option<Cancel>,
-    ) -> Result<Self, AudioError> {
+    fn connect(cancel: Option<Cancel>) -> Result<Self, AudioError> {
         let lib = api::lib()
             .ok_or_else(|| AudioError::new(AudioErrorKind::Output, "libpulse unavailable"))?;
-        #[allow(clippy::expect_used, reason = "every NUL was just removed")]
-        let name = CString::new(what.replace('\0', "")).expect("NUL removed");
-        let sink = sink
-            .map(CString::new)
-            .transpose()
-            .map_err(|e| AudioError::new(AudioErrorKind::Output, e.to_string()))?;
         let mut out = Self {
             lib,
             // SAFETY: no arguments; the result is checked below.
@@ -82,7 +98,7 @@ impl Stream {
             context: ptr::null_mut(),
             stream: ptr::null_mut(),
             cancel,
-            written: Recent::new(),
+            written: Recent::new(std::num::NonZeroU32::MIN),
             started: false,
         };
         if out.mainloop.is_null() {
@@ -92,8 +108,8 @@ impl Stream {
             ));
         }
         let until = Instant::now() + TIMEOUT;
-        // SAFETY: the module contract; `name`, `sink`, `spec` and `attr` are live locals the calls
-        // copy; on an early return `out`'s Drop frees what was made.
+        // SAFETY: the module contract; the context name lives for the call;
+        // on an early return `out`'s Drop frees what was made.
         unsafe {
             out.context = (lib.pa_context_new)(
                 (lib.pa_mainloop_get_api)(out.mainloop),
@@ -111,9 +127,60 @@ impl Stream {
             while (lib.pa_context_get_state)(out.context) != CONTEXT_READY {
                 out.wait(until, "connect")?;
             }
+        }
+        Ok(out)
+    }
+
+    pub fn devices() -> Result<Vec<crate::AudioOutputDeviceInfo>, AudioError> {
+        let mut out = Self::connect(None)?;
+        let mut devices = Vec::<crate::AudioOutputDeviceInfo>::new();
+        // SAFETY: each operation borrows devices only until wait_operation returns (or cancels).
+        unsafe {
+            let data = ptr::from_mut(&mut devices).cast();
+            let default = (out.lib.pa_context_get_sink_info_by_name)(
+                out.context,
+                c"@DEFAULT_SINK@".as_ptr(),
+                sink_info,
+                data,
+            );
+            out.wait_operation(default, "default sink")?;
+            let default = devices.pop();
+            let list = (out.lib.pa_context_get_sink_info_list)(
+                out.context,
+                sink_info,
+                ptr::from_mut(&mut devices).cast(),
+            );
+            out.wait_operation(list, "sink list")?;
+            for device in &mut devices {
+                device.is_default = default.as_ref().is_some_and(|d| d.id == device.id);
+            }
+        }
+        Ok(devices)
+    }
+
+    pub fn rate(&self) -> std::num::NonZeroU32 {
+        self.written.rate
+    }
+
+    pub fn open(
+        what: &str,
+        sink: Option<&str>,
+        cancel: Option<Cancel>,
+    ) -> Result<Self, AudioError> {
+        let mut out = Self::connect(cancel)?;
+        let lib = out.lib;
+        let name = CString::new(what.replace('\0', ""))
+            .map_err(|e| AudioError::new(AudioErrorKind::Output, e.to_string()))?;
+        let sink = sink
+            .map(CString::new)
+            .transpose()
+            .map_err(|e| AudioError::new(AudioErrorKind::Output, e.to_string()))?;
+        let until = Instant::now() + TIMEOUT;
+        // SAFETY: the connected context and all arguments live for the calls.
+        unsafe {
             let spec = SampleSpec {
                 format: SAMPLE_FLOAT32LE,
-                rate: RATE,
+                rate: 48_000, // A valid initial spec; FIX_RATE takes the sink's rate.
                 channels: CHANNELS,
             };
             out.stream = (lib.pa_stream_new)(out.context, name.as_ptr(), &spec, ptr::null());
@@ -122,7 +189,7 @@ impl Stream {
             }
             let attr = BufferAttr {
                 maxlength: u32::MAX,
-                tlength: RATE * FRAME_BYTES / 10,
+                tlength: spec.rate * FRAME_BYTES / 10,
                 prebuf: u32::MAX,
                 minreq: u32::MAX,
                 fragsize: u32::MAX,
@@ -133,7 +200,7 @@ impl Stream {
                 out.stream,
                 sink.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
                 &attr,
-                ADJUST_LATENCY | NOT_MONOTONIC,
+                ADJUST_LATENCY | NOT_MONOTONIC | FIX_RATE,
                 ptr::null(),
                 ptr::null_mut(),
             ) < 0
@@ -143,6 +210,10 @@ impl Stream {
             while (lib.pa_stream_get_state)(out.stream) != STREAM_READY {
                 out.wait(until, "open")?;
             }
+            out.written.rate = (lib.pa_stream_get_sample_spec)(out.stream)
+                .as_ref()
+                .and_then(|s| std::num::NonZeroU32::new(s.rate))
+                .ok_or_else(|| out.error("sample rate"))?;
         }
         Ok(out)
     }
@@ -218,6 +289,15 @@ impl Stream {
                 ptr::from_ref(&result).cast_mut().cast(),
             )
         };
+        self.wait_operation(handle, what)?;
+        if result.get() == 1 {
+            Ok(())
+        } else {
+            Err(self.error(what))
+        }
+    }
+
+    fn wait_operation(&mut self, handle: Ptr, what: &str) -> Result<(), AudioError> {
         if handle.is_null() {
             return Err(self.error(what));
         }
@@ -231,11 +311,7 @@ impl Stream {
         while unsafe { (self.lib.pa_operation_get_state)(pending.handle) } == OPERATION_RUNNING {
             self.wait(until, what)?;
         }
-        if result.get() == 1 {
-            Ok(())
-        } else {
-            Err(self.error(what))
-        }
+        Ok(())
     }
 
     pub fn write(&mut self, mut bytes: &[u8]) -> Result<(), AudioError> {
@@ -278,9 +354,10 @@ impl Stream {
         if !self.started {
             self.started = timing.playing != 0
                 && timing.since_underrun >= 0
-                && bytes_to_micros(timing.since_underrun as u64) > timing.sink_usec;
+                && bytes_to_micros(timing.since_underrun as u64, self.rate().get())
+                    > timing.sink_usec;
             if !self.started {
-                return Ok(bytes_to_micros(self.written.written()));
+                return Ok(bytes_to_micros(self.written.written(), self.rate().get()));
             }
         }
         let (mut latency, mut negative) = (0, 0);
@@ -322,7 +399,7 @@ impl Stream {
             return Ok(false);
         };
         // The server reads on while the rewrite travels to it: 10 ms past where it read.
-        let ahead = u64::from(RATE * FRAME_BYTES) / 100;
+        let ahead = u64::from(self.rate().get() * FRAME_BYTES) / 100;
         let from = (read + ahead) / u64::from(FRAME_BYTES) * u64::from(FRAME_BYTES);
         let Some(faded) = self.written.faded_from(from, fade) else {
             return Ok(false);

@@ -2,9 +2,7 @@ use super::output::{capturing, NULL_OUTPUT};
 use super::source::is_network;
 use super::types::{AudioError, AudioErrorKind, TrackHint};
 use super::{playback, probe, process};
-use crate::dsp::{
-    song_chain, song_end, stream_chain, within_end, DspChain, ReplayGainSetting, UserGain,
-};
+use crate::dsp::{song_end, within_end, ReplayGainSetting, UserGain};
 use crate::{AudioInput, AudioSourceFactory, ReplayGain, ReplayGainTags};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -17,6 +15,7 @@ pub(super) enum Terminal {
     Pending,
     Eof,
     Failed,
+    Reroute,
 }
 
 /// Writer-owned resources can outlive a cancelled controller until cleanup completes.
@@ -164,6 +163,7 @@ impl Run {
         match self.terminal.load(Ordering::Acquire) {
             1 => Terminal::Eof,
             2 => Terminal::Failed,
+            3 => Terminal::Reroute,
             _ => Terminal::Pending,
         }
     }
@@ -191,17 +191,7 @@ fn cancel_flag(factory: &dyn AudioSourceFactory) -> Arc<AtomicBool> {
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
 }
 
-/// A song's own chain (its ReplayGain from `tags`) at the stream's rate and channels.
-fn song_dsp(replay_gain: Arc<ReplayGainSetting>, tags: ReplayGainTags) -> Arc<Mutex<DspChain>> {
-    Arc::new(Mutex::new(song_chain(
-        replay_gain,
-        tags,
-        playback::CHAIN_RATE,
-        playback::CHAIN_CHANNELS,
-    )))
-}
-
-/// A song to go on into, ready: what its decoder reads, from where to where, and its own chain.
+/// A song to go on into, ready: what its decoder reads, its span and ReplayGain.
 pub(super) struct Following {
     pub(super) serial: u64,
     pub(super) id: u64,
@@ -209,7 +199,7 @@ pub(super) struct Following {
     pub(super) start: Duration,
     pub(super) stop: Option<Duration>,
     pub(super) duration: Option<Duration>,
-    pub(super) dsp: Arc<Mutex<DspChain>>,
+    pub(super) tags: ReplayGainTags,
     /// How long it overlaps the end of the song before it (`AudioNext::crossfade`).
     pub(super) crossfade: Duration,
 }
@@ -275,10 +265,7 @@ pub struct AudioPlayer {
     stop: Option<Duration>,
     volume: Arc<UserGain>,
     replay_gain: Arc<ReplayGainSetting>,
-    /// The song's own processing (`crate::dsp::song_chain`), which every run of it goes through,
-    /// reset when a run starts; the run's writer holds it while it processes a block. The effects
-    /// are the stream's: each run makes its own chain of them.
-    dsp: Arc<Mutex<DspChain>>,
+    tags: ReplayGainTags,
     run: Option<PlaybackRun>,
     cancelled: Arc<AtomicBool>,
     terminal: Terminal,
@@ -351,7 +338,6 @@ impl AudioPlayer {
         let silent = NULL_OUTPUT.load(Ordering::Relaxed) && !capturing();
         let replay_gain = Arc::new(ReplayGainSetting::default());
         replay_gain.set(options.replay_gain);
-        let dsp = song_dsp(replay_gain.clone(), tags);
         Ok(AudioPlayer {
             input,
             at: Duration::ZERO,
@@ -361,7 +347,7 @@ impl AudioPlayer {
             stop: None,
             volume: Arc::new(UserGain::default()),
             replay_gain,
-            dsp,
+            tags,
             run: None,
             cancelled,
             terminal: Terminal::Pending,
@@ -419,19 +405,12 @@ impl AudioPlayer {
         ));
         let (r, input, from) = (run.clone(), self.input.clone(), self.at);
         let (_, limit) = span_to(from, self.end());
-        let (dsp, effects, volume) = (self.dsp.clone(), self.effects.clone(), self.volume.clone());
+        let (tags, gain) = (self.tags, self.replay_gain.clone());
+        let (effects, volume) = (self.effects.clone(), self.volume.clone());
         let h = std::thread::Builder::new()
             .name("pulse-out".into())
             .spawn(move || {
-                // The run's own stream chain, made on its thread: activating the effects may
-                // wait on the plugin host thread.
-                let stream = stream_chain(
-                    effects.as_ref(),
-                    playback::CHAIN_RATE,
-                    playback::CHAIN_CHANNELS,
-                );
-                let processing = playback::Processing::new(dsp, stream, volume);
-                playback::write_run(r, &input, (from, limit), processing)
+                playback::write_run(r, &input, (from, limit), tags, gain, effects, volume)
             })
             .map_err(|e| {
                 AudioError::new(
@@ -513,7 +492,6 @@ impl AudioPlayer {
             return;
         };
         let (slot, wanted) = (self.next.clone(), self.next_wanted.clone());
-        let replay_gain = self.replay_gain.clone();
         // Probing reads the file: not on the host's thread. One that does not start is not
         // followed, and this song ends as it would have.
         let _ = std::thread::Builder::new()
@@ -525,7 +503,6 @@ impl AudioPlayer {
                     return;
                 };
                 let (duration, tags) = probe_input(&input, next.duration, &cancelled);
-                let dsp = song_dsp(replay_gain, tags);
                 let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
                 if wanted.load(Ordering::Acquire) == serial && !cancelled.load(Ordering::Acquire) {
                     *slot = Some(Arc::new(Following {
@@ -535,7 +512,7 @@ impl AudioPlayer {
                         start: next.start,
                         stop: next.stop,
                         duration,
-                        dsp,
+                        tags,
                         crossfade: next.crossfade,
                     }));
                 }
@@ -573,7 +550,7 @@ impl AudioPlayer {
             self.input = song.input.clone();
             self.duration = song.duration;
             self.stop = song.stop;
-            self.dsp = song.dsp.clone();
+            self.tags = song.tags;
             self.at = song.start;
             self.song_origin = Duration::from_micros(at);
             self.followed = Some(song.id);
@@ -634,7 +611,7 @@ impl AudioPlayer {
         }
         match terminal {
             Terminal::Eof => true,
-            Terminal::Failed => false,
+            Terminal::Failed | Terminal::Reroute => false,
             Terminal::Pending => {
                 // A decoder must report success; a duration hint cannot turn a failed or
                 // truncated network stream into EOF. Clock-only output has no decoder.
@@ -655,6 +632,14 @@ impl AudioPlayer {
             ));
         }
         self.take_up();
+        if self.playing
+            && self
+                .run
+                .as_ref()
+                .is_some_and(|r| r.state.terminal() == Terminal::Reroute)
+        {
+            return self.start(); // halt keeps the last heard position, just as for a seek.
+        }
         let failed = self
             .run
             .as_ref()

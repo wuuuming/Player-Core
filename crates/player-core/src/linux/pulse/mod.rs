@@ -5,7 +5,6 @@ mod stream;
 
 pub use recent::Recent;
 pub use stream::Stream;
-pub const RATE: u32 = 48_000;
 /// Stereo, the channels every stream has.
 pub const CHANNELS: u8 = 2;
 /// One frame as the stream takes it: `CHANNELS` little-endian `f32` samples.
@@ -22,8 +21,8 @@ pub fn samples(bytes: &[u8]) -> impl Iterator<Item = f32> + '_ {
 }
 
 /// The stream bytes `duration` takes, in whole frames.
-pub fn duration_to_bytes(duration: std::time::Duration) -> u64 {
-    let frames = duration.as_nanos() * u128::from(RATE) / 1_000_000_000;
+pub fn duration_to_bytes(duration: std::time::Duration, rate: u32) -> u64 {
+    let frames = duration.as_nanos() * u128::from(rate) / 1_000_000_000;
     u64::try_from(frames).unwrap_or(u64::MAX / 8) * FRAME_BYTES as u64
 }
 
@@ -33,8 +32,8 @@ pub fn whole_frames(n: usize) -> usize {
 }
 
 /// How long `bytes` of stream frames play, in microseconds.
-pub fn bytes_to_micros(bytes: u64) -> u64 {
-    (u128::from(bytes) * 1_000_000 / u128::from(RATE * FRAME_BYTES)).min(u128::from(u64::MAX))
+pub fn bytes_to_micros(bytes: u64, rate: u32) -> u64 {
+    (u128::from(bytes) * 1_000_000 / u128::from(rate * FRAME_BYTES)).min(u128::from(u64::MAX))
         as u64
 }
 
