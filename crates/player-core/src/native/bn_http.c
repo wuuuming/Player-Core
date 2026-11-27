@@ -22,6 +22,10 @@ int bn_http_open_options(AVDictionary **options,
     static const char *const kHttpDefaults[][2] = {
         /* microseconds: the read/write ceiling the protocol layer enforces itself */
         {"rw_timeout", "10000000"},
+#ifndef _WIN32
+        /* GnuTLS verifies the peer using the system trust store. */
+        {"tls_verify", "1"},
+#endif
         {"reconnect", "1"},
         {"reconnect_streamed", "1"},
         {"reconnect_delay_max", "4"},

@@ -171,9 +171,9 @@ static int bn_audio_demux_seek(BnAudioDecoder *decoder, int64_t from) {
     BnDemux *demux = bn_audio_demux(decoder);
     int served = 0;
     if (bn_demux_ensure(demux) == 0) {
-        AcquireSRWLockExclusive(&demux->lock);
+        bn_lock(&demux->lock);
         served = bn_demux_trim_to_locked(demux, from);
-        ReleaseSRWLockExclusive(&demux->lock);
+        bn_unlock(&demux->lock);
     }
     return served ? 0 : bn_demux_request_seek(demux, INT64_MIN, from, from, 0);
 }
@@ -198,10 +198,10 @@ int32_t bn_audio_decoder_input_state(BnAudioDecoder *decoder, int64_t *out_queue
     BnDemux *demux = &decoder->demux;
     if (!demux->thread)
         return BN_AUDIO_OK;
-    AcquireSRWLockExclusive(&demux->lock);
+    bn_lock(&demux->lock);
     *out_queued_us = bn_demux_queued_us_locked(demux);
     *out_ended = demux->eof || demux->error != 0;
-    ReleaseSRWLockExclusive(&demux->lock);
+    bn_unlock(&demux->lock);
     return BN_AUDIO_OK;
 }
 
@@ -218,7 +218,9 @@ void bn_audio_decoder_destroy(BnAudioDecoder **decoder) {
         return;
     BnAudioDecoder *value = *decoder;
     bn_demux_stop(&value->demux);
+#ifdef _WIN32
     bn_tak_destroy(value->tak);
+#endif
     if (value->flac_parser)
         av_parser_close(value->flac_parser);
     free(value->dsd_bytes);
@@ -329,9 +331,14 @@ static int32_t bn_audio_decoder_finish_open(
         return BN_AUDIO_OK;
     }
 
+#ifndef _WIN32
+    (void)path;
+    (void)source;
+#endif
     AVChannelLayout tak_layout = {0};
     enum AVSampleFormat input_format;
     AVChannelLayout *input_layout;
+#ifdef _WIN32
     if (stream->codecpar->codec_id == AV_CODEC_ID_TAK) {
         result = bn_tak_open(decoder, path, source, &tak_layout, error, error_capacity);
         if (result < 0) {
@@ -342,7 +349,9 @@ static int32_t bn_audio_decoder_finish_open(
         }
         input_format = AV_SAMPLE_FMT_S32;
         input_layout = &tak_layout;
-    } else {
+    } else
+#endif
+    {
         result = bn_audio_open_codec(decoder, stream, error, error_capacity);
         if (result != BN_AUDIO_OK) {
             bn_audio_decoder_destroy(&decoder);
@@ -498,14 +507,17 @@ int32_t bn_audio_decoder_open(const char *local_path,
         bn_audio_decoder_destroy(&decoder);
         return BN_AUDIO_INPUT;
     }
+    wchar_t *path = NULL;
+#ifdef _WIN32
     int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, local_path, -1, NULL, 0);
-    wchar_t *path = length > 0 ? malloc((size_t) length * sizeof(wchar_t)) : NULL;
+    path = length > 0 ? malloc((size_t) length * sizeof(wchar_t)) : NULL;
     if (!path || !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, local_path, -1, path, length)) {
         free(path);
         bn_error(error, error_capacity, "could not convert the audio input path to UTF-16");
         bn_audio_decoder_destroy(&decoder);
         return BN_AUDIO_INPUT;
     }
+#endif
     int32_t status = bn_audio_decoder_finish_open(
         decoder, -1, path, NULL, output_sample_rate, output_channels,
         out_decoder, out_info, error, error_capacity, NULL);
@@ -775,10 +787,13 @@ int32_t bn_audio_decoder_seek(BnAudioDecoder *decoder, int64_t target_pts,
     }
     av_packet_unref(decoder->packet);
     av_frame_unref(decoder->frame);
+#ifdef _WIN32
     if (decoder->tak) {
         if (bn_tak_seek(decoder, target_pts, error, error_capacity) < 0)
             return BN_AUDIO_SEEK;
-    } else {
+    } else
+#endif
+    {
         /* A flushed decoder needs its declared history before the requested sample. WMA drops
          * two frames while rebuilding its overlap; starting at the target loses those samples.
          * The pump still trims decoded PCM to the original target. */
@@ -1099,8 +1114,11 @@ int32_t bn_audio_decoder_decode_next(BnAudioDecoder *decoder,
     av_frame_unref(decoder->frame);
 
     for (;;) {
-        int result = decoder->tak ? bn_tak_receive(decoder, error, error_capacity)
-                                  : avcodec_receive_frame(decoder->codec, decoder->frame);
+        int result =
+#ifdef _WIN32
+            decoder->tak ? bn_tak_receive(decoder, error, error_capacity) :
+#endif
+            avcodec_receive_frame(decoder->codec, decoder->frame);
         if (result == 0) {
             int64_t output_sample_pts = 0;
             int has_output_sample_pts = 0;

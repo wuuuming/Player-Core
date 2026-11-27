@@ -11,13 +11,15 @@ int32_t bn_error_is_network_failure(int32_t code) {
         code == AVERROR(ECONNREFUSED) || code == AVERROR(ENETDOWN) ||
         code == AVERROR(ENETRESET) || code == AVERROR(ENETUNREACH) ||
         code == AVERROR(EHOSTUNREACH) || code == AVERROR(ENOTCONN) ||
-        code == AVERROR(EPIPE) ||
+#ifdef _WIN32
         /* Windows FFmpeg socket failures can carry Winsock, not CRT errno values. */
         code == AVERROR(WSAETIMEDOUT) || code == AVERROR(WSAECONNRESET) ||
         code == AVERROR(WSAECONNABORTED) || code == AVERROR(WSAECONNREFUSED) ||
         code == AVERROR(WSAENETDOWN) || code == AVERROR(WSAENETRESET) ||
         code == AVERROR(WSAENETUNREACH) || code == AVERROR(WSAEHOSTUNREACH) ||
-        code == AVERROR(WSAENOTCONN);
+        code == AVERROR(WSAENOTCONN) ||
+#endif
+        code == AVERROR(EPIPE);
 }
 
 /* Stable private bridge from Rust ErrorKind. Unknown I/O must not turn into retryable EIO. */
@@ -43,16 +45,16 @@ int bn_interrupt_expired(void *opaque) {
     BnInterrupt *interrupt = opaque;
     if (!interrupt)
         return 0;
-    if (InterlockedCompareExchange(&interrupt->cancelled, 0, 0) ||
+    if (bn_load(&interrupt->cancelled) ||
         (interrupt->external_cancelled &&
          interrupt->external_cancelled(interrupt->cancel_opaque)))
         return 1;
-    const int64_t deadline = InterlockedCompareExchange64(&interrupt->deadline_us, 0, 0);
+    const int64_t deadline = bn_load64(&interrupt->deadline_us);
     return deadline != 0 && av_gettime_relative() >= deadline;
 }
 
 void bn_interrupt_deadline(BnInterrupt *interrupt, int64_t budget_us) {
-    InterlockedExchange64(&interrupt->deadline_us,
+    bn_store64(&interrupt->deadline_us,
                           budget_us > 0 ? av_gettime_relative() + budget_us : 0);
 }
 
@@ -62,7 +64,7 @@ int bn_source_read(const BnByteSource *source, BnInterrupt *interrupt,
                    uint8_t *buffer, int size) {
     if (bn_interrupt_expired(interrupt))
         return AVERROR_EXIT;
-    const int64_t deadline = InterlockedCompareExchange64(&interrupt->deadline_us, 0, 0);
+    const int64_t deadline = bn_load64(&interrupt->deadline_us);
     const int64_t remaining = deadline ? deadline - av_gettime_relative() : 0;
     if (deadline && remaining <= 0)
         return AVERROR_EXIT;

@@ -200,15 +200,20 @@ fn only_folder(dir: &Path, prefix: &str) -> PathBuf {
 }
 
 fn main() {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
-    }
+    let windows = match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("windows") => true,
+        Ok("linux") => false,
+        _ => return,
+    };
 
     // The FFmpeg SDK: the vendored audio-only build, or
     // `<NOVA_MEDIA_NATIVE_DIR>/ffmpeg-master-latest-win64-lgpl-shared` when a machine names
     // another build of the same ABI (avcodec-62).
     println!("cargo:rerun-if-env-changed=NOVA_MEDIA_NATIVE_DIR");
-    let ffmpeg = match env::var_os("NOVA_MEDIA_NATIVE_DIR") {
+    let external = windows
+        .then(|| env::var_os("NOVA_MEDIA_NATIVE_DIR"))
+        .flatten();
+    let ffmpeg = match external.as_ref() {
         Some(dir) => PathBuf::from(dir).join("ffmpeg-master-latest-win64-lgpl-shared"),
         None => PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
             .join(FFMPEG_VENDORED),
@@ -220,36 +225,43 @@ fn main() {
     );
     let ffmpeg_include = ffmpeg.join("include");
 
-    for required in [
-        ffmpeg_include.join("libavformat/avformat.h"),
-        ffmpeg_include.join("libavcodec/avcodec.h"),
-        ffmpeg_include.join("libavfilter/avfilter.h"),
-        ffmpeg_include.join("libswresample/swresample.h"),
-        ffmpeg.join("lib/avformat.lib"),
-        ffmpeg.join("lib/avcodec.lib"),
-        ffmpeg.join("lib/avutil.lib"),
-        ffmpeg.join("lib/avfilter.lib"),
-        ffmpeg.join("lib/swresample.lib"),
-    ] {
-        require_file(&required);
+    let libraries = [
+        ("avformat", 62),
+        ("avcodec", 62),
+        ("avutil", 60),
+        ("avfilter", 11),
+        ("swresample", 6),
+    ];
+    let lib_dir = ffmpeg.join(if windows { "lib" } else { "linux-x86_64" });
+    for (name, version) in libraries {
+        let file = if windows {
+            format!("{name}.lib")
+        } else {
+            format!("lib{name}.so.{version}")
+        };
+        require_file(&lib_dir.join(&file));
+        println!("cargo:rerun-if-changed={}", lib_dir.join(file).display());
     }
 
     // The authored shim, one translation unit per responsibility. `player_core.h` is the public
     // ABI the Rust side binds; `player_core_internal.h` is what the units share among themselves.
-    let native_sources = [
+    let mut native_sources = vec![
         "src/native/bn_common.c",
         "src/native/bn_demux.c",
         "src/native/bn_http.c",
         "src/native/bn_audio_decoder.c",
         "src/native/bn_upmix.c",
-        "src/native/bn_tak_decoder.c",
         "src/native/bn_tags.c",
     ];
-    for source in native_sources {
+    if windows {
+        native_sources.push("src/native/bn_tak_decoder.c");
+    }
+    for source in &native_sources {
         println!("cargo:rerun-if-changed={source}");
     }
     println!("cargo:rerun-if-changed=src/native/player_core.h");
     println!("cargo:rerun-if-changed=src/native/player_core_internal.h");
+    println!("cargo:rerun-if-changed=src/native/bn_thread.h");
     println!("cargo:rerun-if-changed=third_party/tak/tak_deco_lib.h");
     let mut native = cc::Build::new();
     native
@@ -259,9 +271,12 @@ fn main() {
         .warnings(true);
     #[cfg(feature = "instrument")]
     native.define("BN_INSTRUMENT", None);
+    if !windows {
+        native.define("_GNU_SOURCE", None);
+    }
     native.compile("player_core_native");
 
-    if env::var_os("CARGO_FEATURE_ASIO").is_some() {
+    if windows && env::var_os("CARGO_FEATURE_ASIO").is_some() {
         println!("cargo:rerun-if-env-changed=CPAL_ASIO_DIR");
         println!("cargo:rerun-if-changed=src/native/bn_asio.cpp");
         let sdk = env::var_os("CPAL_ASIO_DIR")
@@ -276,15 +291,17 @@ fn main() {
             .compile("player_core_asio");
     }
 
-    println!(
-        "cargo:rustc-link-search=native={}",
-        ffmpeg.join("lib").display()
-    );
-    println!("cargo:rustc-link-lib=dylib=avformat");
-    println!("cargo:rustc-link-lib=dylib=avcodec");
-    println!("cargo:rustc-link-lib=dylib=avutil");
-    println!("cargo:rustc-link-lib=dylib=avfilter");
-    println!("cargo:rustc-link-lib=dylib=swresample");
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    for (name, version) in libraries {
+        if windows {
+            println!("cargo:rustc-link-lib=dylib={name}");
+        } else {
+            println!("cargo:rustc-link-lib=dylib:+verbatim=lib{name}.so.{version}");
+        }
+    }
+    if !windows {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    }
 
     let output_directory =
         PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set for build scripts"));
@@ -296,19 +313,25 @@ fn main() {
         profile_directory.to_path_buf(),
         profile_directory.join("deps"),
     ] {
-        copy_dlls(&ffmpeg.join("bin"), &destination);
+        if windows {
+            copy_dlls(&ffmpeg.join("bin"), &destination);
+            copy_dlls(Path::new("third_party/tak"), &destination);
+        } else {
+            for (name, version) in libraries {
+                let file = format!("lib{name}.so.{version}");
+                fs::copy(lib_dir.join(&file), destination.join(file)).expect("copy FFmpeg library");
+            }
+        }
         // What a package of these DLLs carries as FFmpeg's licence, and where they came from (a
         // release names the matching source from it).
         let _ = fs::copy(
             ffmpeg.join("LICENSE.txt"),
             destination.join("FFmpeg-LICENSE.txt"),
         );
-        let origin = match env::var_os("NOVA_MEDIA_NATIVE_DIR") {
+        let origin = match &external {
             Some(_) => ffmpeg.display().to_string(),
             None => format!("FFmpeg {FFMPEG_COMMIT}, audio-only (Player-Core tools/ffmpeg-audio)"),
         };
         let _ = fs::write(destination.join("FFmpeg-ORIGIN.txt"), origin + "\n");
-        // Consumers stage this unchanged file beside their application executable as well.
-        copy_dlls(Path::new("third_party/tak"), &destination);
     }
 }

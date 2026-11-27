@@ -5,23 +5,23 @@
 #ifdef BN_INSTRUMENT
 /* What every demux queue in the process holds: payload bytes, packets, and the bytes of the
  * buffers carrying the payload. See `BnBufferCensus`. */
-static volatile LONG64 bn_census[3];
+static BnAtomic64 bn_census[3];
 
 /* Counts `packet` into (`sign` 1) or out of (-1) the census. */
 static void bn_demux_census(const BnDemux *demux, const AVPacket *packet, int sign) {
     (void) demux;
-    InterlockedExchangeAdd64(&bn_census[0], sign * (int64_t) packet->size);
-    InterlockedExchangeAdd64(&bn_census[1], sign);
-    InterlockedExchangeAdd64(&bn_census[2],
+    bn_add64(&bn_census[0], sign * (int64_t) packet->size);
+    bn_add64(&bn_census[1], sign);
+    bn_add64(&bn_census[2],
                              sign * (int64_t) (packet->buf ? packet->buf->size : packet->size));
 }
 
 void bn_buffer_census(BnBufferCensus *out) {
     if (!out)
         return;
-    out->audio_queue_bytes = InterlockedCompareExchange64(&bn_census[0], 0, 0);
-    out->audio_queue_packets = InterlockedCompareExchange64(&bn_census[1], 0, 0);
-    out->audio_queue_buffer_bytes = InterlockedCompareExchange64(&bn_census[2], 0, 0);
+    out->audio_queue_bytes = bn_load64(&bn_census[0]);
+    out->audio_queue_packets = bn_load64(&bn_census[1]);
+    out->audio_queue_buffer_bytes = bn_load64(&bn_census[2]);
 }
 #else
 #define bn_demux_census(demux, packet, sign) ((void) 0)
@@ -121,11 +121,11 @@ void bn_demux_set_source_local(BnDemux *demux, int local) {
             bn_demux_size(demux);
         return;
     }
-    AcquireSRWLockExclusive(&demux->lock);
+    bn_lock(&demux->lock);
     demux->source_local = local != 0;
     bn_demux_size(demux);
-    WakeAllConditionVariable(&demux->changed);
-    ReleaseSRWLockExclusive(&demux->lock);
+    bn_wake(&demux->changed);
+    bn_unlock(&demux->lock);
 }
 
 static int64_t bn_packet_pts(const AVPacket *packet) {
@@ -282,13 +282,13 @@ static int bn_demux_recover(BnDemux *demux, int64_t resume_ts) {
     return result;
 }
 
-static DWORD WINAPI bn_demux_main(LPVOID opaque) {
+static BN_THREAD_RESULT bn_demux_main(void *opaque) {
     BnDemux *demux = (BnDemux *) opaque;
     AVPacket *packet = av_packet_alloc();
-    AcquireSRWLockExclusive(&demux->lock);
+    bn_lock(&demux->lock);
     if (!packet) {
         demux->error = AVERROR(ENOMEM);
-        WakeAllConditionVariable(&demux->changed);
+        bn_wake(&demux->changed);
     }
     while (packet && !demux->stop) {
         if (demux->seek_pending) {
@@ -297,7 +297,7 @@ static DWORD WINAPI bn_demux_main(LPVOID opaque) {
                           max_ts = demux->seek_max;
             const int flags = demux->seek_flags;
             demux->seek_pending = 0;
-            ReleaseSRWLockExclusive(&demux->lock);
+            bn_unlock(&demux->lock);
             /* A latched byte-layer error belongs to the position being left. */
             if (demux->format->pb)
                 demux->format->pb->error = 0;
@@ -309,7 +309,7 @@ static DWORD WINAPI bn_demux_main(LPVOID opaque) {
                 fprintf(stderr, "player-core[demux] seek to %lld failed: %s\n", (long long) target,
                         av_err2str(result));
 #endif
-            AcquireSRWLockExclusive(&demux->lock);
+            bn_lock(&demux->lock);
             if (demux->epoch == epoch && result < 0 && !demux->stop &&
                 bn_demux_error_is_recoverable(result) && demux->retries < BN_DEMUX_READ_RETRIES) {
                 /* The same seek again: the failed one closed its connection on the way out. */
@@ -324,19 +324,19 @@ static DWORD WINAPI bn_demux_main(LPVOID opaque) {
                     demux->eof = 1;
                 else
                     demux->error = result;
-                WakeAllConditionVariable(&demux->changed);
+                bn_wake(&demux->changed);
             }
             continue;
         }
         if (demux->eof || demux->error || bn_demux_full_locked(demux)) {
-            SleepConditionVariableSRW(&demux->changed, &demux->lock, INFINITE, 0);
+            bn_wait(&demux->changed, &demux->lock);
             continue;
         }
         const uint64_t epoch = demux->epoch;
         /* EOF normalization does I/O outside the lock, but seek state belongs to this epoch. */
         const int64_t reached = demux->last_dts != AV_NOPTS_VALUE ? demux->last_dts
                                 : demux->has_seek_target ? demux->seek_target : AV_NOPTS_VALUE;
-        ReleaseSRWLockExclusive(&demux->lock);
+        bn_unlock(&demux->lock);
         bn_interrupt_deadline(demux->interrupt, BN_READ_DEADLINE_US);
         const int read_result = av_read_frame(demux->format, packet);
         bn_interrupt_deadline(demux->interrupt, 0);
@@ -353,7 +353,7 @@ static DWORD WINAPI bn_demux_main(LPVOID opaque) {
                     packet->stream_index, packet->size, (long long) packet->pts,
                     (long long) packet->pos);
 #endif
-        AcquireSRWLockExclusive(&demux->lock);
+        bn_lock(&demux->lock);
         if (demux->stop || demux->epoch != epoch || demux->seek_pending) {
             /* A seek arrived while the read was in flight: whatever it read is from before it. */
             av_packet_unref(packet);
@@ -378,9 +378,9 @@ static DWORD WINAPI bn_demux_main(LPVOID opaque) {
             const int64_t resume_ts = resumed_from != AV_NOPTS_VALUE ? resumed_from
                                       : demux->has_seek_target      ? demux->seek_target
                                                                     : AV_NOPTS_VALUE;
-            ReleaseSRWLockExclusive(&demux->lock);
+            bn_unlock(&demux->lock);
             const int recovered = bn_demux_recover(demux, resume_ts);
-            AcquireSRWLockExclusive(&demux->lock);
+            bn_lock(&demux->lock);
             if (demux->stop || demux->epoch != epoch || demux->seek_pending)
                 continue;
             if (recovered >= 0) {
@@ -398,7 +398,7 @@ static DWORD WINAPI bn_demux_main(LPVOID opaque) {
                 demux->eof = 1;
             else
                 demux->error = result;
-            WakeAllConditionVariable(&demux->changed);
+            bn_wake(&demux->changed);
             continue;
         }
         if (packet->stream_index != demux->stream_index) {
@@ -422,7 +422,7 @@ static DWORD WINAPI bn_demux_main(LPVOID opaque) {
         if (!queued) {
             demux->error = AVERROR(ENOMEM);
             av_packet_unref(packet);
-            WakeAllConditionVariable(&demux->changed);
+            bn_wake(&demux->changed);
             continue;
         }
         av_packet_move_ref(queued, packet);
@@ -435,9 +435,9 @@ static DWORD WINAPI bn_demux_main(LPVOID opaque) {
         if (pts != AV_NOPTS_VALUE &&
             (demux->newest_pts == AV_NOPTS_VALUE || pts > demux->newest_pts))
             demux->newest_pts = pts;
-        WakeAllConditionVariable(&demux->changed);
+        bn_wake(&demux->changed);
     }
-    ReleaseSRWLockExclusive(&demux->lock);
+    bn_unlock(&demux->lock);
     av_packet_free(&packet);
     return 0;
 }
@@ -452,13 +452,17 @@ int bn_demux_ensure(BnDemux *demux) {
     demux->ring = (AVPacket **) calloc((size_t) demux->capacity, sizeof(*demux->ring));
     if (!demux->ring)
         return AVERROR(ENOMEM);
-    InitializeSRWLock(&demux->lock);
-    InitializeConditionVariable(&demux->changed);
+    if (bn_sync_init(&demux->lock, &demux->changed) != 0) {
+        free(demux->ring);
+        demux->ring = NULL;
+        return AVERROR(ENOMEM);
+    }
     demux->newest_pts = AV_NOPTS_VALUE;
     demux->last_dts = AV_NOPTS_VALUE;
     demux->skip_through_dts = AV_NOPTS_VALUE;
-    demux->thread = CreateThread(NULL, 0, bn_demux_main, demux, 0, NULL);
+    demux->thread = bn_start(bn_demux_main, demux);
     if (!demux->thread) {
+        bn_sync_destroy(&demux->lock, &demux->changed);
         free(demux->ring);
         demux->ring = NULL;
         return AVERROR(ENOMEM);
@@ -473,7 +477,7 @@ int bn_demux_take(BnDemux *demux, AVPacket *out) {
     if (started < 0)
         return started;
     int result = 0;
-    AcquireSRWLockExclusive(&demux->lock);
+    bn_lock(&demux->lock);
     for (;;) {
         if (demux->count > 0 && !demux->seek_pending) {
             AVPacket *packet = demux->ring[demux->head];
@@ -484,7 +488,7 @@ int bn_demux_take(BnDemux *demux, AVPacket *out) {
             bn_demux_census(demux, packet, -1);
             av_packet_move_ref(out, packet);
             av_packet_free(&packet);
-            WakeAllConditionVariable(&demux->changed);
+            bn_wake(&demux->changed);
             result = 1;
             break;
         }
@@ -496,12 +500,12 @@ int bn_demux_take(BnDemux *demux, AVPacket *out) {
             result = AVERROR_EOF;
             break;
         }
-        if (!SleepConditionVariableSRW(&demux->changed, &demux->lock, BN_AUDIO_TAKE_WAIT_MS, 0)) {
+        if (!bn_wait_ms(&demux->changed, &demux->lock, BN_AUDIO_TAKE_WAIT_MS)) {
             result = 0;
             break;
         }
     }
-    ReleaseSRWLockExclusive(&demux->lock);
+    bn_unlock(&demux->lock);
     return result;
 }
 
@@ -512,7 +516,7 @@ int bn_demux_request_seek(BnDemux *demux, int64_t min_ts, int64_t target,
     const int started = bn_demux_ensure(demux);
     if (started < 0)
         return started;
-    AcquireSRWLockExclusive(&demux->lock);
+    bn_lock(&demux->lock);
     demux->epoch += 1;
     bn_demux_clear_locked(demux);
     demux->seek_pending = 1;
@@ -526,8 +530,8 @@ int bn_demux_request_seek(BnDemux *demux, int64_t min_ts, int64_t target,
     demux->retries = 0;
     demux->eof = 0;
     demux->error = 0;
-    WakeAllConditionVariable(&demux->changed);
-    ReleaseSRWLockExclusive(&demux->lock);
+    bn_wake(&demux->changed);
+    bn_unlock(&demux->lock);
     return 0;
 }
 
@@ -535,15 +539,15 @@ int bn_demux_request_seek(BnDemux *demux, int64_t min_ts, int64_t target,
 void bn_demux_stop(BnDemux *demux) {
     if (!demux->thread)
         return;
-    AcquireSRWLockExclusive(&demux->lock);
+    bn_lock(&demux->lock);
     demux->stop = 1;
     /* Cancellation is separate from deadlines; an operation cannot reset it accidentally. */
-    InterlockedExchange(&demux->interrupt->cancelled, 1);
-    WakeAllConditionVariable(&demux->changed);
-    ReleaseSRWLockExclusive(&demux->lock);
-    WaitForSingleObject(demux->thread, INFINITE);
-    CloseHandle(demux->thread);
-    demux->thread = NULL;
+    bn_store(&demux->interrupt->cancelled, 1);
+    bn_wake(&demux->changed);
+    bn_unlock(&demux->lock);
+    bn_join(demux->thread);
+    bn_sync_destroy(&demux->lock, &demux->changed);
+    demux->thread = 0;
     bn_demux_clear_locked(demux);
     free(demux->ring);
     demux->ring = NULL;
@@ -556,9 +560,9 @@ void bn_demux_stop(BnDemux *demux) {
 void bn_demux_cancel(BnDemux *demux) {
     if (!demux->thread)
         return;
-    AcquireSRWLockExclusive(&demux->lock);
+    bn_lock(&demux->lock);
     demux->stop = 1;
-    InterlockedExchange(&demux->interrupt->cancelled, 1);
-    WakeAllConditionVariable(&demux->changed);
-    ReleaseSRWLockExclusive(&demux->lock);
+    bn_store(&demux->interrupt->cancelled, 1);
+    bn_wake(&demux->changed);
+    bn_unlock(&demux->lock);
 }

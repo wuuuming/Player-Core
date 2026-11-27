@@ -16,7 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "bn_thread.h"
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -33,8 +33,8 @@
 
 typedef struct BnInterrupt {
     /* `av_gettime_relative()` microseconds, or 0 for "no deadline". */
-    volatile LONG64 deadline_us; /* Access ONLY through Interlocked operations. */
-    volatile LONG cancelled;
+    BnAtomic64 deadline_us;
+    BnAtomic cancelled;
     /* Immutable after publication. Owner retains opaque until all native calls finish. */
     int (*external_cancelled)(void *);
     void *cancel_opaque;
@@ -76,9 +76,9 @@ typedef struct BnDemux {
     size_t bytes_limit;
     size_t bytes_floor;
     int64_t horizon_us;
-    HANDLE thread;
-    SRWLOCK lock;
-    CONDITION_VARIABLE changed;
+    BnThread thread;
+    BnLock lock;
+    BnCondition changed;
     AVPacket **ring;
     int capacity;
     int head;
